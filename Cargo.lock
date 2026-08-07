@@ -14205,6 +14205,24 @@ dependencies = [
 ]
 
 [[package]]
+name = "project_brain_panel"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "async-tungstenite",
+ "chrono",
+ "futures 0.3.32",
+ "gpui",
+ "log",
+ "serde",
+ "serde_json",
+ "tokio",
+ "ui",
+ "workspace",
+ "zed-reqwest",
+]
+
+[[package]]
 name = "project_panel"
 version = "0.1.0"
 dependencies = [
@@ -23288,6 +23306,7 @@ dependencies = [
  "pretty_assertions",
  "profiling",
  "project",
+ "project_brain_panel",
  "project_panel",
  "project_symbols",
  "prompt_store",

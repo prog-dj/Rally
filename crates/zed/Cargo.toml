@@ -168,6 +168,7 @@ paths.workspace = true
 picker.workspace = true
 profiling.workspace = true
 project.workspace = true
+project_brain_panel.workspace = true
 project_panel.workspace = true
 project_symbols.workspace = true
 prompt_store.workspace = true

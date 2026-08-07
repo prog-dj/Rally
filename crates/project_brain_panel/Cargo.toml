@@ -1,0 +1,27 @@
+[package]
+name = "project_brain_panel"
+version = "0.1.0"
+edition.workspace = true
+publish.workspace = true
+license = "GPL-3.0-or-later"
+
+[lints]
+workspace = true
+
+[lib]
+path = "src/project_brain_panel.rs"
+doctest = false
+
+[dependencies]
+anyhow.workspace = true
+async-tungstenite = { workspace = true, features = ["tokio", "tokio-rustls-manual-roots"] }
+chrono.workspace = true
+futures.workspace = true
+gpui.workspace = true
+log.workspace = true
+reqwest = { workspace = true, features = ["json"] }
+serde = { workspace = true, features = ["derive"] }
+serde_json.workspace = true
+ui.workspace = true
+workspace.workspace = true
+tokio = { version = "1", features = ["rt-multi-thread", "time"] }

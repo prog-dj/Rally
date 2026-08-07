@@ -160,6 +160,7 @@ members = [
     "crates/prettier",
     "crates/project",
     "crates/project_benchmarks",
+    "crates/project_brain_panel",
     "crates/project_panel",
     "crates/project_symbols",
     "crates/prompt_store",
@@ -425,6 +426,7 @@ picker_preview = { path = "crates/picker_preview" }
 prettier = { path = "crates/prettier" }
 settings_profile_selector = { path = "crates/settings_profile_selector" }
 project = { path = "crates/project" }
+project_brain_panel = { path = "crates/project_brain_panel" }
 project_panel = { path = "crates/project_panel" }
 project_symbols = { path = "crates/project_symbols" }
 prompt_store = { path = "crates/prompt_store" }
