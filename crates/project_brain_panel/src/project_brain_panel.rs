@@ -18,7 +18,10 @@ use workspace::{
 // TODO: make configurable via settings/env var
 const BACKEND_BASE_URL: &str = "http://localhost:8080";
 const BACKEND_WS_URL: &str = "ws://localhost:8080";
-const DEFAULT_PROJECT_ID: &str = "default";
+
+fn get_project_id() -> Option<String> {
+    std::env::var("RALLY_PROJECT_ID").ok()
+}
 
 static EVENT_COUNTER: AtomicU64 = AtomicU64::new(1);
 
@@ -123,9 +126,14 @@ impl ProjectBrainPanel {
         let task = cx.spawn(async move |this: WeakEntity<Self>, cx: &mut AsyncApp| {
             // 1. Fetch initial feed history (run on the Tokio runtime, since
             //    reqwest needs a real Tokio reactor for DNS/networking).
+            let Some(project_id) = get_project_id() else {
+                log::error!("RALLY_PROJECT_ID is not set. Project Brain cannot connect.");
+                return;
+            };
+
             let feed_url = format!(
                 "{}/projects/{}/feed?limit=50",
-                BACKEND_BASE_URL, DEFAULT_PROJECT_ID
+                BACKEND_BASE_URL, project_id
             );
             let feed_result = tokio_runtime()
                 .spawn(async move {
@@ -143,7 +151,7 @@ impl ProjectBrainPanel {
             }
 
             // 2. Connect to WebSocket stream & reconnect loop
-            let ws_url = format!("{}/projects/{}/live", BACKEND_WS_URL, DEFAULT_PROJECT_ID);
+            let ws_url = format!("{}/projects/{}/live", BACKEND_WS_URL, project_id);
             loop {
                 let _ = this.update(cx, |panel, cx| {
                     panel.connection_status = ConnectionStatus::Connecting;
@@ -244,7 +252,7 @@ impl ProjectBrainPanel {
                     self.push_feed_event(
                         FeedEvent {
                             id: event_id,
-                            project_id: Some(DEFAULT_PROJECT_ID.to_string()),
+                            project_id: get_project_id(),
                             actor_id: Some("agent".to_string()),
                             entity_type: Some("job".to_string()),
                             entity_id: None,
