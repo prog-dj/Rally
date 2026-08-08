@@ -16,9 +16,11 @@ doctest = false
 anyhow.workspace = true
 async-tungstenite = { workspace = true, features = ["tokio", "tokio-rustls-manual-roots"] }
 chrono.workspace = true
+editor.workspace = true
 futures.workspace = true
 gpui.workspace = true
 log.workspace = true
+menu.workspace = true
 reqwest = { workspace = true, features = ["json"] }
 serde = { workspace = true, features = ["derive"] }
 serde_json.workspace = true
