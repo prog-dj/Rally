@@ -6,7 +6,7 @@ use editor::Editor;
 use futures::StreamExt;
 use gpui::{
     Action, App, AsyncApp, ClipboardItem, Context, Entity, EventEmitter, FocusHandle, Focusable,
-    IntoElement, Pixels, Render, Task, Window, px, prelude::*, rgb, WeakEntity,
+    IntoElement, Pixels, Render, Task, Window, px, prelude::*, WeakEntity,
 };
 use serde::{Deserialize, Serialize};
 use tokio::runtime::Runtime;
@@ -1006,7 +1006,7 @@ impl ProjectBrainPanel {
                     .child(
                         Label::new(job.status.clone())
                             .size(LabelSize::XSmall)
-                            .color(Color::Muted),
+                            .color(status_color(&job.status)),
                     ),
             )
             .child(
@@ -1340,10 +1340,14 @@ impl Panel for ProjectBrainPanel {
 
 impl Render for ProjectBrainPanel {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        // Theme-native semantic colors rather than fixed hex — matches
+        // whatever Zed theme (light/dark/any accent) the user has active,
+        // the same "success/warning/critical, kept separate from the
+        // accent" split used by the dashboard and rally_frontend.
         let (dot_color, status_label) = match self.connection_status {
-            ConnectionStatus::Connected => (rgb(0x22c55e), "Connected"),
-            ConnectionStatus::Connecting => (rgb(0xeab308), "Connecting..."),
-            ConnectionStatus::Disconnected => (rgb(0xef4444), "Disconnected"),
+            ConnectionStatus::Connected => (Color::Success.color(cx), "Connected"),
+            ConnectionStatus::Connecting => (Color::Warning.color(cx), "Connecting..."),
+            ConnectionStatus::Disconnected => (Color::Error.color(cx), "Disconnected"),
         };
 
         v_flex()
@@ -1404,7 +1408,7 @@ impl Render for ProjectBrainPanel {
                             h_flex()
                                 .gap_2()
                                 .items_center()
-                                .child(div().w_2().h_2().rounded_full().bg(rgb(0x22c55e)))
+                                .child(div().w_2().h_2().rounded_full().bg(Color::Success.color(cx)))
                                 .child(Label::new(display_name).size(LabelSize::Small))
                         }))
                     }),
@@ -1472,6 +1476,19 @@ impl Render for ProjectBrainPanel {
                             }))
                     }),
             )
+    }
+}
+
+/// Semantic status coloring — queued/idle stays muted, running/in-progress
+/// reads as a warning-toned "in flight", done as success, failed as error.
+/// Mirrors the same split used by the dashboard and rally_frontend: status
+/// color is separate from the panel's accent, never doubles as it.
+fn status_color(status: &str) -> Color {
+    match status {
+        "running" | "in_progress" => Color::Warning,
+        "done" | "resolved" | "accepted" => Color::Success,
+        "failed" | "blocked" => Color::Error,
+        _ => Color::Muted,
     }
 }
 
