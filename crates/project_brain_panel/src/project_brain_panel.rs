@@ -243,9 +243,23 @@ pub struct SearchResponse {
     pub results: Vec<SearchResultEntry>,
 }
 
+/// Which internal view the panel is showing below the tab strip. Splitting
+/// these into real switchable views (rather than stacking every section
+/// vertically) is what makes the panel feel like its own product surface
+/// instead of one long scrolling sidebar.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PanelView {
+    Feed,
+    Tasks,
+    Investigations,
+    Decisions,
+    AgentJobs,
+}
+
 pub struct ProjectBrainPanel {
     focus_handle: FocusHandle,
     position: DockPosition,
+    active_view: PanelView,
     feed_events: Vec<FeedEvent>,
     presence: Vec<PresenceEntry>,
     /// Fetched from `GET /projects/:id/actors` — resolves actor ids to
@@ -268,6 +282,15 @@ pub struct ProjectBrainPanel {
     creating_task: bool,
     new_task_title_editor: Entity<Editor>,
     new_task_description_editor: Entity<Editor>,
+    creating_investigation: bool,
+    new_investigation_title_editor: Entity<Editor>,
+    creating_decision: bool,
+    new_decision_title_editor: Entity<Editor>,
+    new_decision_context_editor: Entity<Editor>,
+    new_decision_text_editor: Entity<Editor>,
+    new_decision_consequences_editor: Entity<Editor>,
+    creating_agent_job: bool,
+    new_agent_job_goal_editor: Entity<Editor>,
     /// Who this session acts as. Seeded from `RALLY_ACTOR_ID` if set;
     /// otherwise populated by the onboarding "Create Actor" form.
     actor_id: Option<String>,
@@ -307,10 +330,41 @@ impl ProjectBrainPanel {
             editor.set_placeholder_text("Your name…", window, cx);
             editor
         });
+        let new_investigation_title_editor = cx.new(|cx| {
+            let mut editor = Editor::single_line(window, cx);
+            editor.set_placeholder_text("Investigation title…", window, cx);
+            editor
+        });
+        let new_decision_title_editor = cx.new(|cx| {
+            let mut editor = Editor::single_line(window, cx);
+            editor.set_placeholder_text("Decision title…", window, cx);
+            editor
+        });
+        let new_decision_context_editor = cx.new(|cx| {
+            let mut editor = Editor::single_line(window, cx);
+            editor.set_placeholder_text("Context (optional)…", window, cx);
+            editor
+        });
+        let new_decision_text_editor = cx.new(|cx| {
+            let mut editor = Editor::single_line(window, cx);
+            editor.set_placeholder_text("The decision itself…", window, cx);
+            editor
+        });
+        let new_decision_consequences_editor = cx.new(|cx| {
+            let mut editor = Editor::single_line(window, cx);
+            editor.set_placeholder_text("Consequences (optional)…", window, cx);
+            editor
+        });
+        let new_agent_job_goal_editor = cx.new(|cx| {
+            let mut editor = Editor::single_line(window, cx);
+            editor.set_placeholder_text("What should this agent job do?", window, cx);
+            editor
+        });
 
         let mut this = Self {
             focus_handle: cx.focus_handle(),
             position: DockPosition::Right,
+            active_view: PanelView::Feed,
             feed_events: Vec::new(),
             presence: Vec::new(),
             actors: Vec::new(),
@@ -327,6 +381,15 @@ impl ProjectBrainPanel {
             creating_task: false,
             new_task_title_editor,
             new_task_description_editor,
+            creating_investigation: false,
+            new_investigation_title_editor,
+            creating_decision: false,
+            new_decision_title_editor,
+            new_decision_context_editor,
+            new_decision_text_editor,
+            new_decision_consequences_editor,
+            creating_agent_job: false,
+            new_agent_job_goal_editor,
             actor_id: get_actor_id(),
             actor_token: std::env::var("RALLY_ACTOR_TOKEN").ok(),
             onboarding_name_editor,
@@ -696,6 +759,278 @@ impl ProjectBrainPanel {
         .detach();
     }
 
+    /// Cycles a task through open -> in_progress -> blocked -> done -> open.
+    /// GPUI has no native <select>, so a click-to-advance button is the
+    /// simplest inline status control that fits this panel's width.
+    fn cycle_task_status(&mut self, task_id: String, current_status: String, cx: &mut Context<Self>) {
+        let Some(actor_id) = self.actor_id.clone() else {
+            self.action_status = Some("Create an actor above to update tasks".into());
+            cx.notify();
+            return;
+        };
+        let token = self.actor_token.clone();
+        let next = next_task_status(&current_status);
+        let url = format!("{}/tasks/{}", backend_base_url(), task_id);
+        let body = serde_json::json!({ "actor_id": actor_id, "status": next });
+        cx.spawn(async move |this: WeakEntity<Self>, cx: &mut AsyncApp| {
+            let result = tokio_runtime().spawn(patch_json(url, body, token)).await;
+            let status = match result {
+                Ok(Ok(())) => None,
+                Ok(Err(err)) => Some(format!("Update task failed: {err:#}")),
+                Err(err) => Some(format!("Update task failed: {err:#}")),
+            };
+            let _ = this.update(cx, |panel, cx| {
+                panel.action_status = status;
+                panel.refresh_project_context(cx);
+            });
+        })
+        .detach();
+    }
+
+    fn toggle_create_investigation_form(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.creating_investigation = !self.creating_investigation;
+        if self.creating_investigation {
+            self.new_investigation_title_editor
+                .update(cx, |editor, cx| editor.clear(window, cx));
+            self.new_investigation_title_editor.focus_handle(cx).focus(window, cx);
+        }
+        cx.notify();
+    }
+
+    fn submit_new_investigation(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(actor_id) = self.actor_id.clone() else {
+            self.action_status = Some("Create an actor above to open investigations".into());
+            cx.notify();
+            return;
+        };
+        let token = self.actor_token.clone();
+        let Some(project_id) = get_project_id() else {
+            return;
+        };
+        let title = self
+            .new_investigation_title_editor
+            .read(cx)
+            .text(cx)
+            .trim()
+            .to_string();
+        if title.is_empty() {
+            return;
+        }
+        self.new_investigation_title_editor
+            .update(cx, |editor, cx| editor.clear(window, cx));
+        self.creating_investigation = false;
+
+        let url = format!("{}/projects/{}/investigations", backend_base_url(), project_id);
+        let body = serde_json::json!({ "actor_id": actor_id, "title": title });
+        cx.spawn(async move |this: WeakEntity<Self>, cx: &mut AsyncApp| {
+            let result = tokio_runtime().spawn(post_json(url, body, token)).await;
+            let status = match result {
+                Ok(Ok(())) => Some("Investigation opened".to_string()),
+                Ok(Err(err)) => Some(format!("Open investigation failed: {err:#}")),
+                Err(err) => Some(format!("Open investigation failed: {err:#}")),
+            };
+            let _ = this.update(cx, |panel, cx| {
+                panel.action_status = status;
+                panel.refresh_project_context(cx);
+            });
+        })
+        .detach();
+    }
+
+    fn resolve_investigation(&mut self, investigation_id: String, cx: &mut Context<Self>) {
+        let Some(actor_id) = self.actor_id.clone() else {
+            self.action_status = Some("Create an actor above to resolve investigations".into());
+            cx.notify();
+            return;
+        };
+        let token = self.actor_token.clone();
+        let url = format!("{}/investigations/{}", backend_base_url(), investigation_id);
+        let body = serde_json::json!({ "actor_id": actor_id, "status": "resolved" });
+        cx.spawn(async move |this: WeakEntity<Self>, cx: &mut AsyncApp| {
+            let result = tokio_runtime().spawn(patch_json(url, body, token)).await;
+            let status = match result {
+                Ok(Ok(())) => Some("Investigation resolved".to_string()),
+                Ok(Err(err)) => Some(format!("Resolve failed: {err:#}")),
+                Err(err) => Some(format!("Resolve failed: {err:#}")),
+            };
+            let _ = this.update(cx, |panel, cx| {
+                panel.action_status = status;
+                panel.refresh_project_context(cx);
+            });
+        })
+        .detach();
+    }
+
+    fn toggle_create_decision_form(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.creating_decision = !self.creating_decision;
+        if self.creating_decision {
+            for editor in [
+                &self.new_decision_title_editor,
+                &self.new_decision_context_editor,
+                &self.new_decision_text_editor,
+                &self.new_decision_consequences_editor,
+            ] {
+                editor.update(cx, |editor, cx| editor.clear(window, cx));
+            }
+            self.new_decision_title_editor.focus_handle(cx).focus(window, cx);
+        }
+        cx.notify();
+    }
+
+    fn submit_new_decision(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(actor_id) = self.actor_id.clone() else {
+            self.action_status = Some("Create an actor above to record decisions".into());
+            cx.notify();
+            return;
+        };
+        let token = self.actor_token.clone();
+        let Some(project_id) = get_project_id() else {
+            return;
+        };
+        let title = self.new_decision_title_editor.read(cx).text(cx).trim().to_string();
+        if title.is_empty() {
+            return;
+        }
+        let context_text = self.new_decision_context_editor.read(cx).text(cx).trim().to_string();
+        let decision_text = self.new_decision_text_editor.read(cx).text(cx).trim().to_string();
+        let consequences = self
+            .new_decision_consequences_editor
+            .read(cx)
+            .text(cx)
+            .trim()
+            .to_string();
+
+        for editor in [
+            &self.new_decision_title_editor,
+            &self.new_decision_context_editor,
+            &self.new_decision_text_editor,
+            &self.new_decision_consequences_editor,
+        ] {
+            editor.update(cx, |editor, cx| editor.clear(window, cx));
+        }
+        self.creating_decision = false;
+
+        let url = format!("{}/projects/{}/decisions", backend_base_url(), project_id);
+        let body = serde_json::json!({
+            "actor_id": actor_id,
+            "title": title,
+            "context": context_text,
+            "decision": decision_text,
+            "consequences": consequences,
+        });
+        cx.spawn(async move |this: WeakEntity<Self>, cx: &mut AsyncApp| {
+            let result = tokio_runtime().spawn(post_json(url, body, token)).await;
+            let status = match result {
+                Ok(Ok(())) => Some("Decision recorded".to_string()),
+                Ok(Err(err)) => Some(format!("Record decision failed: {err:#}")),
+                Err(err) => Some(format!("Record decision failed: {err:#}")),
+            };
+            let _ = this.update(cx, |panel, cx| {
+                panel.action_status = status;
+                panel.refresh_project_context(cx);
+            });
+        })
+        .detach();
+    }
+
+    fn toggle_create_agent_job_form(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.creating_agent_job = !self.creating_agent_job;
+        if self.creating_agent_job {
+            self.new_agent_job_goal_editor
+                .update(cx, |editor, cx| editor.clear(window, cx));
+            self.new_agent_job_goal_editor.focus_handle(cx).focus(window, cx);
+        }
+        cx.notify();
+    }
+
+    fn submit_new_agent_job(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(actor_id) = self.actor_id.clone() else {
+            self.action_status = Some("Create an actor above to create agent jobs".into());
+            cx.notify();
+            return;
+        };
+        let token = self.actor_token.clone();
+        let Some(project_id) = get_project_id() else {
+            return;
+        };
+        let goal = self.new_agent_job_goal_editor.read(cx).text(cx).trim().to_string();
+        if goal.is_empty() {
+            return;
+        }
+        self.new_agent_job_goal_editor
+            .update(cx, |editor, cx| editor.clear(window, cx));
+        self.creating_agent_job = false;
+
+        let url = format!("{}/projects/{}/agent-jobs", backend_base_url(), project_id);
+        let body = serde_json::json!({ "actor_id": actor_id, "goal": goal });
+        cx.spawn(async move |this: WeakEntity<Self>, cx: &mut AsyncApp| {
+            let result = tokio_runtime().spawn(post_json(url, body, token)).await;
+            let status = match result {
+                Ok(Ok(())) => Some("Agent job created".to_string()),
+                Ok(Err(err)) => Some(format!("Create agent job failed: {err:#}")),
+                Err(err) => Some(format!("Create agent job failed: {err:#}")),
+            };
+            let _ = this.update(cx, |panel, cx| {
+                panel.action_status = status;
+                panel.refresh_project_context(cx);
+            });
+        })
+        .detach();
+    }
+
+    /// Invokes the headless runtime directly — the backend calls Anthropic
+    /// and runs the tool-use loop itself, unlike `submit_steering_message`
+    /// which just leaves a note. Requires the active actor to be the job's
+    /// current claimant.
+    fn run_turn(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(job_id) = self.expanded_job_id.clone() else {
+            return;
+        };
+        let Some(actor_id) = self.actor_id.clone() else {
+            self.action_status = Some("Create an actor above to run the headless agent".into());
+            cx.notify();
+            return;
+        };
+        let token = self.actor_token.clone();
+        let content = self
+            .steering_editor
+            .update(cx, |editor, cx| {
+                let text = editor.text(cx);
+                editor.clear(window, cx);
+                text
+            })
+            .trim()
+            .to_string();
+        if content.is_empty() {
+            return;
+        }
+        self.expanded_job_id = None;
+        self.expanded_transcript_job_id = Some(job_id.clone());
+
+        let url = format!("{}/agent-jobs/{}/turns", backend_base_url(), job_id);
+        let body = serde_json::json!({ "actor_id": actor_id, "content": content });
+        cx.spawn(async move |this: WeakEntity<Self>, cx: &mut AsyncApp| {
+            let result = tokio_runtime().spawn(post_json(url, body, token)).await;
+            let status = match result {
+                Ok(Ok(())) => None,
+                Ok(Err(err)) => Some(format!("Run failed: {err:#}")),
+                Err(err) => Some(format!("Run failed: {err:#}")),
+            };
+            let turns_result = tokio_runtime().spawn(fetch_turns(job_id.clone())).await;
+            let _ = this.update(cx, |panel, cx| {
+                if status.is_some() {
+                    panel.action_status = status;
+                }
+                if let Ok(Ok(turns)) = turns_result {
+                    panel.job_turns.insert(job_id, turns);
+                }
+                panel.refresh_project_context(cx);
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
     fn toggle_transcript(&mut self, job_id: String, cx: &mut Context<Self>) {
         if self.expanded_transcript_job_id.as_deref() == Some(job_id.as_str()) {
             self.expanded_transcript_job_id = None;
@@ -786,55 +1121,129 @@ impl ProjectBrainPanel {
             .unwrap_or_else(|| actor_id.chars().take(8).collect())
     }
 
-    fn render_brief(&mut self, cx: &mut Context<Self>) -> gpui::AnyElement {
-        let section_label = |text: &'static str| {
-            Label::new(text).size(LabelSize::XSmall).color(Color::Muted)
-        };
+    fn set_active_view(&mut self, view: PanelView, cx: &mut Context<Self>) {
+        self.active_view = view;
+        cx.notify();
+    }
 
+    fn render_tab_strip(&mut self, cx: &mut Context<Self>) -> gpui::AnyElement {
+        let tabs: [(PanelView, &'static str); 5] = [
+            (PanelView::Feed, "Feed"),
+            (PanelView::Tasks, "Tasks"),
+            (PanelView::Investigations, "Investigations"),
+            (PanelView::Decisions, "Decisions"),
+            (PanelView::AgentJobs, "Agent Jobs"),
+        ];
+        h_flex()
+            .gap_1()
+            .flex_wrap()
+            .pb_1()
+            .border_b_1()
+            .border_color(cx.theme().colors().border)
+            .children(tabs.into_iter().map(|(view, label)| {
+                let is_active = self.active_view == view;
+                Button::new(format!("panel-tab-{label}"), label)
+                    .label_size(LabelSize::Small)
+                    .color(if is_active { Color::Accent } else { Color::Muted })
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        this.set_active_view(view, cx);
+                    }))
+                    .into_any_element()
+            }))
+            .into_any_element()
+    }
+
+    fn render_action_status(&self) -> Option<gpui::AnyElement> {
+        self.action_status.clone().map(|status| {
+            Label::new(status)
+                .size(LabelSize::XSmall)
+                .color(Color::Accent)
+                .into_any_element()
+        })
+    }
+
+    fn render_active_view(&mut self, cx: &mut Context<Self>) -> gpui::AnyElement {
         let Some(brief) = self.brief.clone() else {
-            return v_flex()
-                .gap_1()
-                .child(section_label("PROJECT BRIEF"))
-                .child(
-                    Label::new("Loading shared memory…")
-                        .size(LabelSize::Small)
-                        .color(Color::Muted),
-                )
+            return Label::new("Loading shared memory…")
+                .size(LabelSize::Small)
+                .color(Color::Muted)
                 .into_any_element();
         };
-
-        let mut root = v_flex()
-            .gap_2()
-            .p_2()
-            .rounded_md()
-            .bg(cx.theme().colors().element_background)
-            .child(section_label("PROJECT BRIEF — shared memory entrypoint"));
-
-        if let Some(status) = self.action_status.clone() {
-            root = root.child(Label::new(status).size(LabelSize::XSmall).color(Color::Accent));
+        match self.active_view {
+            PanelView::Feed => self.render_feed_view(cx),
+            PanelView::Tasks => self.render_tasks_view(&brief, cx),
+            PanelView::Investigations => self.render_investigations_view(&brief, cx),
+            PanelView::Decisions => self.render_decisions_view(cx),
+            PanelView::AgentJobs => self.render_agent_jobs_view(&brief, cx),
         }
+    }
 
-        root = root.child(
+    fn render_feed_view(&mut self, cx: &mut Context<Self>) -> gpui::AnyElement {
+        v_flex()
+            .gap_2()
+            .child(self.render_search_section(cx))
+            .child(
+                v_flex()
+                    .gap_1()
+                    .child(
+                        Label::new("PROJECT FEED").size(LabelSize::XSmall).color(Color::Muted),
+                    )
+                    .child(if self.feed_events.is_empty() {
+                        v_flex().id("project-brain-feed-list").p_2().child(
+                            Label::new("No feed events recorded yet.")
+                                .size(LabelSize::Small)
+                                .color(Color::Muted),
+                        )
+                    } else {
+                        v_flex()
+                            .id("project-brain-feed-list")
+                            .gap_2()
+                            .children(self.feed_events.iter().map(|event| {
+                                let relative_time = format_relative_time(event.created_at);
+                                let verb_badge = event.verb.as_deref().unwrap_or("");
+
+                                v_flex()
+                                    .p_2()
+                                    .rounded_md()
+                                    .bg(cx.theme().colors().element_background)
+                                    .gap_1()
+                                    .child(
+                                        h_flex().justify_between().items_center().child(
+                                            Label::new(event.summary.clone()).size(LabelSize::Small),
+                                        ),
+                                    )
+                                    .child(
+                                        h_flex()
+                                            .justify_between()
+                                            .items_center()
+                                            .when(!verb_badge.is_empty(), |this| {
+                                                this.child(
+                                                    Label::new(verb_badge.to_string())
+                                                        .size(LabelSize::XSmall)
+                                                        .color(Color::Muted),
+                                                )
+                                            })
+                                            .child(
+                                                Label::new(relative_time)
+                                                    .size(LabelSize::XSmall)
+                                                    .color(Color::Muted),
+                                            ),
+                                    )
+                            }))
+                    }),
+            )
+            .into_any_element()
+    }
+
+    fn render_tasks_view(&mut self, brief: &ProjectContext, cx: &mut Context<Self>) -> gpui::AnyElement {
+        let mut root = v_flex().gap_2().child(
             h_flex()
                 .justify_between()
                 .items_center()
                 .child(
-                    h_flex()
-                        .gap_1()
-                        .child(
-                            Label::new(format!("{} open tasks", brief.open_tasks.len()))
-                                .size(LabelSize::XSmall)
-                                .color(Color::Muted),
-                        )
-                        .child(Label::new("·").size(LabelSize::XSmall).color(Color::Muted))
-                        .child(
-                            Label::new(format!(
-                                "{} active investigations",
-                                brief.active_investigations.len()
-                            ))
-                            .size(LabelSize::XSmall)
-                            .color(Color::Muted),
-                        ),
+                    Label::new(format!("{} open", brief.open_tasks.len()))
+                        .size(LabelSize::XSmall)
+                        .color(Color::Muted),
                 )
                 .child(
                     Button::new("toggle-new-task", if self.creating_task { "Cancel" } else { "+ New Task" })
@@ -849,27 +1258,306 @@ impl ProjectBrainPanel {
             root = root.child(self.render_task_composer(cx));
         }
 
-        root = root.child(
+        root = root.child(if brief.open_tasks.is_empty() {
+            Label::new("No open tasks.").size(LabelSize::Small).color(Color::Muted).into_any_element()
+        } else {
             v_flex()
-                .gap_1()
-                .child(section_label("AGENT JOBS"))
-                .child(if brief.active_agent_jobs.is_empty() {
-                    v_flex().child(
-                        Label::new("No agent jobs running right now.")
-                            .size(LabelSize::Small)
+                .gap_1p5()
+                .children(brief.open_tasks.iter().map(|task| {
+                    let task_id = task.id.clone();
+                    let task_id_for_status = task.id.clone();
+                    let status = task.status.clone();
+                    v_flex()
+                        .gap_1()
+                        .p_2()
+                        .rounded_md()
+                        .bg(cx.theme().colors().editor_background)
+                        .child(Label::new(task.title.clone()).size(LabelSize::Small).truncate())
+                        .child(
+                            Button::new(format!("cycle-status-{task_id}"), status.replace('_', " "))
+                                .label_size(LabelSize::XSmall)
+                                .color(status_color(&status))
+                                .on_click(cx.listener(move |this, _, _, cx| {
+                                    this.cycle_task_status(
+                                        task_id_for_status.clone(),
+                                        status.clone(),
+                                        cx,
+                                    );
+                                })),
+                        )
+                        .into_any_element()
+                }))
+                .into_any_element()
+        });
+
+        root.into_any_element()
+    }
+
+    fn render_investigations_view(
+        &mut self,
+        brief: &ProjectContext,
+        cx: &mut Context<Self>,
+    ) -> gpui::AnyElement {
+        let mut root = v_flex()
+            .gap_2()
+            .child(
+                h_flex()
+                    .justify_between()
+                    .items_center()
+                    .child(
+                        Label::new(format!("{} active", brief.active_investigations.len()))
+                            .size(LabelSize::XSmall)
                             .color(Color::Muted),
                     )
-                } else {
-                    v_flex()
-                        .gap_1p5()
-                        .children(
-                            brief
-                                .active_agent_jobs
-                                .iter()
-                                .map(|job| self.render_agent_job_row(job, cx)),
+                    .child(
+                        Button::new(
+                            "toggle-new-investigation",
+                            if self.creating_investigation { "Cancel" } else { "+ New Investigation" },
                         )
-                }),
+                        .label_size(LabelSize::Small)
+                        .on_click(cx.listener(|this, _, window, cx| {
+                            this.toggle_create_investigation_form(window, cx);
+                        })),
+                    ),
+            )
+            .child(
+                Label::new(
+                    "Only open investigations are listed — there's no index of resolved ones yet.",
+                )
+                .size(LabelSize::XSmall)
+                .color(Color::Muted),
+            );
+
+        if self.creating_investigation {
+            root = root.child(
+                v_flex()
+                    .gap_1p5()
+                    .p_2()
+                    .rounded_md()
+                    .bg(cx.theme().colors().editor_background)
+                    .child(
+                        div()
+                            .rounded_md()
+                            .border_1()
+                            .border_color(cx.theme().colors().border)
+                            .px_2()
+                            .py_1()
+                            .child(self.new_investigation_title_editor.clone()),
+                    )
+                    .child(
+                        Button::new("create-investigation", "Create")
+                            .label_size(LabelSize::Small)
+                            .color(Color::Accent)
+                            .on_click(cx.listener(|this, _, window, cx| {
+                                this.submit_new_investigation(window, cx);
+                            })),
+                    ),
+            );
+        }
+
+        root = root.child(if brief.active_investigations.is_empty() {
+            Label::new("No open investigations.")
+                .size(LabelSize::Small)
+                .color(Color::Muted)
+                .into_any_element()
+        } else {
+            v_flex()
+                .gap_1p5()
+                .children(brief.active_investigations.iter().map(|investigation| {
+                    let investigation_id = investigation.id.clone();
+                    h_flex()
+                        .justify_between()
+                        .items_center()
+                        .gap_2()
+                        .p_2()
+                        .rounded_md()
+                        .bg(cx.theme().colors().editor_background)
+                        .child(
+                            Label::new(investigation.title.clone())
+                                .size(LabelSize::Small)
+                                .truncate(),
+                        )
+                        .child(
+                            Button::new(format!("resolve-investigation-{investigation_id}"), "Resolve")
+                                .label_size(LabelSize::XSmall)
+                                .on_click(cx.listener(move |this, _, _, cx| {
+                                    this.resolve_investigation(investigation_id.clone(), cx);
+                                })),
+                        )
+                        .into_any_element()
+                }))
+                .into_any_element()
+        });
+
+        root.into_any_element()
+    }
+
+    fn render_decisions_view(&mut self, cx: &mut Context<Self>) -> gpui::AnyElement {
+        let mut root = v_flex()
+            .gap_2()
+            .child(
+                h_flex()
+                    .justify_between()
+                    .items_center()
+                    .child(
+                        Label::new("Recent decisions").size(LabelSize::XSmall).color(Color::Muted),
+                    )
+                    .child(
+                        Button::new(
+                            "toggle-new-decision",
+                            if self.creating_decision { "Cancel" } else { "+ New Decision" },
+                        )
+                        .label_size(LabelSize::Small)
+                        .on_click(cx.listener(|this, _, window, cx| {
+                            this.toggle_create_decision_form(window, cx);
+                        })),
+                    ),
+            )
+            .child(
+                Label::new(
+                    "There's no decisions index endpoint yet — this shows decisions recently seen in the feed.",
+                )
+                .size(LabelSize::XSmall)
+                .color(Color::Muted),
+            );
+
+        if self.creating_decision {
+            root = root.child(
+                v_flex()
+                    .gap_1p5()
+                    .p_2()
+                    .rounded_md()
+                    .bg(cx.theme().colors().editor_background)
+                    .children([
+                        &self.new_decision_title_editor,
+                        &self.new_decision_context_editor,
+                        &self.new_decision_text_editor,
+                        &self.new_decision_consequences_editor,
+                    ].map(|editor| {
+                        div()
+                            .rounded_md()
+                            .border_1()
+                            .border_color(cx.theme().colors().border)
+                            .px_2()
+                            .py_1()
+                            .child(editor.clone())
+                    }))
+                    .child(
+                        Button::new("create-decision", "Create")
+                            .label_size(LabelSize::Small)
+                            .color(Color::Accent)
+                            .on_click(cx.listener(|this, _, window, cx| {
+                                this.submit_new_decision(window, cx);
+                            })),
+                    ),
+            );
+        }
+
+        let recent_decisions: Vec<_> = self
+            .feed_events
+            .iter()
+            .filter(|e| e.entity_type.as_deref() == Some("decision"))
+            .take(10)
+            .cloned()
+            .collect();
+
+        root = root.child(if recent_decisions.is_empty() {
+            Label::new("No decisions in recent activity.")
+                .size(LabelSize::Small)
+                .color(Color::Muted)
+                .into_any_element()
+        } else {
+            v_flex()
+                .gap_1p5()
+                .children(recent_decisions.iter().map(|event| {
+                    v_flex()
+                        .gap_0p5()
+                        .p_2()
+                        .rounded_md()
+                        .bg(cx.theme().colors().editor_background)
+                        .child(Label::new(event.summary.clone()).size(LabelSize::Small))
+                        .child(
+                            Label::new(format_relative_time(event.created_at))
+                                .size(LabelSize::XSmall)
+                                .color(Color::Muted),
+                        )
+                        .into_any_element()
+                }))
+                .into_any_element()
+        });
+
+        root.into_any_element()
+    }
+
+    fn render_agent_jobs_view(
+        &mut self,
+        brief: &ProjectContext,
+        cx: &mut Context<Self>,
+    ) -> gpui::AnyElement {
+        let mut root = v_flex().gap_2().child(
+            h_flex()
+                .justify_between()
+                .items_center()
+                .child(
+                    Label::new(format!("{} tracked", brief.active_agent_jobs.len()))
+                        .size(LabelSize::XSmall)
+                        .color(Color::Muted),
+                )
+                .child(
+                    Button::new(
+                        "toggle-new-agent-job",
+                        if self.creating_agent_job { "Cancel" } else { "+ New Agent Job" },
+                    )
+                    .label_size(LabelSize::Small)
+                    .on_click(cx.listener(|this, _, window, cx| {
+                        this.toggle_create_agent_job_form(window, cx);
+                    })),
+                ),
         );
+
+        if self.creating_agent_job {
+            root = root.child(
+                v_flex()
+                    .gap_1p5()
+                    .p_2()
+                    .rounded_md()
+                    .bg(cx.theme().colors().editor_background)
+                    .child(
+                        div()
+                            .rounded_md()
+                            .border_1()
+                            .border_color(cx.theme().colors().border)
+                            .px_2()
+                            .py_1()
+                            .child(self.new_agent_job_goal_editor.clone()),
+                    )
+                    .child(
+                        Button::new("create-agent-job", "Create")
+                            .label_size(LabelSize::Small)
+                            .color(Color::Accent)
+                            .on_click(cx.listener(|this, _, window, cx| {
+                                this.submit_new_agent_job(window, cx);
+                            })),
+                    ),
+            );
+        }
+
+        root = root.child(if brief.active_agent_jobs.is_empty() {
+            Label::new("No agent jobs running right now.")
+                .size(LabelSize::Small)
+                .color(Color::Muted)
+                .into_any_element()
+        } else {
+            v_flex()
+                .gap_1p5()
+                .children(
+                    brief
+                        .active_agent_jobs
+                        .iter()
+                        .map(|job| self.render_agent_job_row(job, cx)),
+                )
+                .into_any_element()
+        });
 
         root.into_any_element()
     }
@@ -1066,12 +1754,30 @@ impl ProjectBrainPanel {
                             .child(self.steering_editor.clone()),
                     )
                     .child(
-                        Button::new(format!("send-{send_job_id}"), "Send")
-                            .label_size(LabelSize::Small)
-                            .color(Color::Accent)
-                            .on_click(cx.listener(move |this, _, window, cx| {
-                                this.submit_steering_message(window, cx);
-                            })),
+                        h_flex()
+                            .gap_2()
+                            .child(
+                                Button::new(format!("send-{send_job_id}"), "Send")
+                                    .label_size(LabelSize::Small)
+                                    .on_click(cx.listener(move |this, _, window, cx| {
+                                        this.submit_steering_message(window, cx);
+                                    })),
+                            )
+                            .child(
+                                Button::new(format!("run-{job_id}"), "Run")
+                                    .label_size(LabelSize::Small)
+                                    .color(Color::Accent)
+                                    .on_click(cx.listener(move |this, _, window, cx| {
+                                        this.run_turn(window, cx);
+                                    })),
+                            ),
+                    )
+                    .child(
+                        Label::new(
+                            "\"Send\" leaves a steering note. \"Run\" invokes the headless agent directly (needs ANTHROPIC_API_KEY on the backend, and you must be the claimant).",
+                        )
+                        .size(LabelSize::XSmall)
+                        .color(Color::Muted),
                     ),
             );
         }
@@ -1287,6 +1993,21 @@ async fn post_json(url: String, body: serde_json::Value, token: Option<String>) 
     Ok(())
 }
 
+async fn patch_json(url: String, body: serde_json::Value, token: Option<String>) -> anyhow::Result<()> {
+    let client = reqwest::Client::new();
+    let mut req = client.patch(&url).json(&body);
+    if let Some(token) = token {
+        req = req.bearer_auth(token);
+    }
+    let res = req.send().await?;
+    if !res.status().is_success() {
+        let status = res.status();
+        let text = res.text().await.unwrap_or_default();
+        anyhow::bail!("{status}: {text}");
+    }
+    Ok(())
+}
+
 impl Focusable for ProjectBrainPanel {
     fn focus_handle(&self, _cx: &App) -> FocusHandle {
         self.focus_handle.clone()
@@ -1357,7 +2078,7 @@ impl Render for ProjectBrainPanel {
             .size_full()
             .bg(cx.theme().colors().panel_background)
             .p_3()
-            .gap_3()
+            .gap_2()
             // 1. Connection Status Bar
             .child(
                 h_flex()
@@ -1382,99 +2103,47 @@ impl Render for ProjectBrainPanel {
             )
             // 2. Actor onboarding — "who am I", or a form to become someone
             .child(self.render_actor_section(cx))
-            // 3. Search
-            .child(self.render_search_section(cx))
-            // 4. Active Presence Section
+            .children(self.render_action_status())
+            // 3. Compact presence line — always visible regardless of which
+            //    view is active, since "who's around" matters everywhere.
             .child(
-                v_flex()
+                h_flex()
                     .gap_1()
+                    .items_center()
                     .child(
-                        Label::new("ACTIVE PRESENCE")
-                            .size(LabelSize::XSmall)
-                            .color(Color::Muted),
+                        Label::new("PRESENCE").size(LabelSize::XSmall).color(Color::Muted),
                     )
                     .child(if self.presence.is_empty() {
-                        div().child(
-                            Label::new("No active presence")
-                                .size(LabelSize::Small)
-                                .color(Color::Muted),
-                        )
+                        Label::new("· nobody else here")
+                            .size(LabelSize::XSmall)
+                            .color(Color::Muted)
+                            .into_any_element()
                     } else {
-                        v_flex().gap_1().children(self.presence.iter().map(|p| {
-                            // Anyone in this list is currently present — the
-                            // backend only broadcasts the live snapshot.
-                            let display_name = self.display_name_for(&p.actor_id);
-
-                            h_flex()
-                                .gap_2()
-                                .items_center()
-                                .child(div().w_2().h_2().rounded_full().bg(Color::Success.color(cx)))
-                                .child(Label::new(display_name).size(LabelSize::Small))
-                        }))
+                        h_flex()
+                            .gap_2()
+                            .children(self.presence.iter().map(|p| {
+                                let display_name = self.display_name_for(&p.actor_id);
+                                h_flex()
+                                    .gap_1()
+                                    .items_center()
+                                    .child(div().w_1p5().h_1p5().rounded_full().bg(Color::Success.color(cx)))
+                                    .child(Label::new(display_name).size(LabelSize::XSmall))
+                            }))
+                            .into_any_element()
                     }),
             )
-            // 5. Project brief: shared-memory entrypoint + agent monitor
-            .child(self.render_brief(cx))
-            // 6. Scrolling Feed List
+            // 4. Tab strip — Feed / Tasks / Investigations / Decisions /
+            //    Agent Jobs, as real switchable views rather than one long
+            //    vertical stack.
+            .child(self.render_tab_strip(cx))
+            // 5. Whichever view is currently active.
             .child(
                 v_flex()
+                    .id("project-brain-active-view")
                     .flex_1()
-                    .gap_1()
-                    .child(
-                        Label::new("PROJECT FEED")
-                            .size(LabelSize::XSmall)
-                            .color(Color::Muted),
-                    )
-                    .child(if self.feed_events.is_empty() {
-                        v_flex().id("project-brain-feed-list").p_2().child(
-                            Label::new("No feed events recorded yet.")
-                                .size(LabelSize::Small)
-                                .color(Color::Muted),
-                        )
-                    } else {
-                        v_flex()
-                            .id("project-brain-feed-list")
-                            .flex_1()
-                            .min_h(px(0.))
-                            .overflow_y_scroll()
-                            .gap_2()
-                            .children(self.feed_events.iter().map(|event| {
-                                let relative_time = format_relative_time(event.created_at);
-                                let verb_badge = event.verb.as_deref().unwrap_or("");
-
-                                v_flex()
-                                    .p_2()
-                                    .rounded_md()
-                                    .bg(cx.theme().colors().element_background)
-                                    .gap_1()
-                                    .child(
-                                        h_flex()
-                                            .justify_between()
-                                            .items_center()
-                                            .child(
-                                                Label::new(event.summary.clone())
-                                                    .size(LabelSize::Small),
-                                            ),
-                                    )
-                                    .child(
-                                        h_flex()
-                                            .justify_between()
-                                            .items_center()
-                                            .when(!verb_badge.is_empty(), |this| {
-                                                this.child(
-                                                    Label::new(verb_badge.to_string())
-                                                        .size(LabelSize::XSmall)
-                                                        .color(Color::Muted),
-                                                )
-                                            })
-                                            .child(
-                                                Label::new(relative_time)
-                                                    .size(LabelSize::XSmall)
-                                                    .color(Color::Muted),
-                                            ),
-                                    )
-                            }))
-                    }),
+                    .min_h(px(0.))
+                    .overflow_y_scroll()
+                    .child(self.render_active_view(cx)),
             )
     }
 }
@@ -1483,6 +2152,15 @@ impl Render for ProjectBrainPanel {
 /// reads as a warning-toned "in flight", done as success, failed as error.
 /// Mirrors the same split used by the dashboard and rally_frontend: status
 /// color is separate from the panel's accent, never doubles as it.
+fn next_task_status(current: &str) -> &'static str {
+    match current {
+        "open" => "in_progress",
+        "in_progress" => "blocked",
+        "blocked" => "done",
+        _ => "open",
+    }
+}
+
 fn status_color(status: &str) -> Color {
     match status {
         "running" | "in_progress" => Color::Warning,
