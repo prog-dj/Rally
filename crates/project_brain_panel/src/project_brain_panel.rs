@@ -243,6 +243,30 @@ pub struct SearchResponse {
     pub results: Vec<SearchResultEntry>,
 }
 
+#[derive(Clone, Debug, Deserialize)]
+pub struct SimilarWorkMatch {
+    pub title: String,
+    pub status: String,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+pub struct SimilarWorkResponse {
+    pub matches: Vec<SimilarWorkMatch>,
+}
+
+/// A create request that's on hold because something similar already
+/// exists — the create request itself (url + body) is captured here since
+/// the composer that produced it is already cleared by the time this
+/// shows, matching how every other submit_* in this panel works (clear
+/// immediately, then fire the request).
+#[derive(Clone)]
+struct PendingDuplicate {
+    label: String,
+    matches: Vec<SimilarWorkMatch>,
+    create_url: String,
+    create_body: serde_json::Value,
+}
+
 /// Which internal view the panel is showing below the tab strip. Splitting
 /// these into real switchable views (rather than stacking every section
 /// vertically) is what makes the panel feel like its own product surface
@@ -276,6 +300,10 @@ pub struct ProjectBrainPanel {
     job_turns: std::collections::HashMap<String, Vec<SessionTurn>>,
     steering_editor: Entity<Editor>,
     action_status: Option<String>,
+    /// A create request held back pending "yes, create it anyway" —
+    /// populated when a task/investigation/agent job looks like it might
+    /// duplicate something that already exists.
+    pending_duplicate: Option<PendingDuplicate>,
     search_editor: Entity<Editor>,
     search_results: Vec<SearchResultEntry>,
     search_error: Option<String>,
@@ -389,6 +417,7 @@ impl ProjectBrainPanel {
             job_turns: std::collections::HashMap::new(),
             steering_editor,
             action_status: None,
+            pending_duplicate: None,
             search_editor,
             search_results: Vec::new(),
             search_error: None,
@@ -757,15 +786,81 @@ impl ProjectBrainPanel {
         let url = format!("{}/projects/{}/tasks", backend_base_url(), project_id);
         let body = serde_json::json!({
             "actor_id": actor_id,
-            "title": title,
+            "title": title.clone(),
             "description": description,
         });
+        self.check_then_create("task", title, url, body, token, cx);
+    }
+
+    /// Checks for existing work that looks like `label` before actually
+    /// creating anything. If something similar turns up, the create request
+    /// is held (`pending_duplicate`) rather than fired — the composer that
+    /// produced it has already been cleared by the caller, matching every
+    /// other submit_* in this panel (clear immediately, then fire), so the
+    /// request itself carries everything needed to finish the job later.
+    fn check_then_create(
+        &mut self,
+        entity_type: &'static str,
+        label: String,
+        create_url: String,
+        create_body: serde_json::Value,
+        token: Option<String>,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(project_id) = get_project_id() else {
+            return;
+        };
+        let check_text = label.clone();
         cx.spawn(async move |this: WeakEntity<Self>, cx: &mut AsyncApp| {
-            let result = tokio_runtime().spawn(post_json(url, body, token)).await;
+            let similar = tokio_runtime()
+                .spawn(fetch_similar_work(project_id, entity_type, check_text))
+                .await;
+            // If the check itself fails (network hiccup, panic), fail open
+            // rather than block creation on a broken similarity check.
+            let matches = match similar {
+                Ok(Ok(matches)) => matches,
+                _ => Vec::new(),
+            };
+
+            if matches.is_empty() {
+                let result = tokio_runtime().spawn(post_json(create_url, create_body, token)).await;
+                let status = match result {
+                    Ok(Ok(())) => None,
+                    Ok(Err(err)) => Some(format!("Create failed: {err:#}")),
+                    Err(err) => Some(format!("Create failed: {err:#}")),
+                };
+                let _ = this.update(cx, |panel, cx| {
+                    panel.action_status = status;
+                    panel.refresh_project_context(cx);
+                });
+            } else {
+                let _ = this.update(cx, |panel, cx| {
+                    panel.pending_duplicate = Some(PendingDuplicate {
+                        label,
+                        matches,
+                        create_url,
+                        create_body,
+                    });
+                    cx.notify();
+                });
+            }
+        })
+        .detach();
+    }
+
+    fn confirm_pending_duplicate(&mut self, cx: &mut Context<Self>) {
+        let Some(pending) = self.pending_duplicate.take() else {
+            return;
+        };
+        let token = self.actor_token.clone();
+        cx.spawn(async move |this: WeakEntity<Self>, cx: &mut AsyncApp| {
+            let result = tokio_runtime()
+                .spawn(post_json(pending.create_url, pending.create_body, token))
+                .await;
             let status = match result {
-                Ok(Ok(())) => Some("Task created".to_string()),
-                Ok(Err(err)) => Some(format!("Create task failed: {err:#}")),
-                Err(err) => Some(format!("Create task failed: {err:#}")),
+                Ok(Ok(())) => None,
+                Ok(Err(err)) => Some(format!("Create failed: {err:#}")),
+                Err(err) => Some(format!("Create failed: {err:#}")),
             };
             let _ = this.update(cx, |panel, cx| {
                 panel.action_status = status;
@@ -773,6 +868,12 @@ impl ProjectBrainPanel {
             });
         })
         .detach();
+        cx.notify();
+    }
+
+    fn cancel_pending_duplicate(&mut self, cx: &mut Context<Self>) {
+        self.pending_duplicate = None;
+        cx.notify();
     }
 
     /// Cycles a task through open -> in_progress -> blocked -> done -> open.
@@ -837,20 +938,8 @@ impl ProjectBrainPanel {
         self.creating_investigation = false;
 
         let url = format!("{}/projects/{}/investigations", backend_base_url(), project_id);
-        let body = serde_json::json!({ "actor_id": actor_id, "title": title });
-        cx.spawn(async move |this: WeakEntity<Self>, cx: &mut AsyncApp| {
-            let result = tokio_runtime().spawn(post_json(url, body, token)).await;
-            let status = match result {
-                Ok(Ok(())) => Some("Investigation opened".to_string()),
-                Ok(Err(err)) => Some(format!("Open investigation failed: {err:#}")),
-                Err(err) => Some(format!("Open investigation failed: {err:#}")),
-            };
-            let _ = this.update(cx, |panel, cx| {
-                panel.action_status = status;
-                panel.refresh_project_context(cx);
-            });
-        })
-        .detach();
+        let body = serde_json::json!({ "actor_id": actor_id, "title": title.clone() });
+        self.check_then_create("investigation", title, url, body, token, cx);
     }
 
     fn resolve_investigation(&mut self, investigation_id: String, cx: &mut Context<Self>) {
@@ -978,20 +1067,8 @@ impl ProjectBrainPanel {
         self.creating_agent_job = false;
 
         let url = format!("{}/projects/{}/agent-jobs", backend_base_url(), project_id);
-        let body = serde_json::json!({ "actor_id": actor_id, "goal": goal });
-        cx.spawn(async move |this: WeakEntity<Self>, cx: &mut AsyncApp| {
-            let result = tokio_runtime().spawn(post_json(url, body, token)).await;
-            let status = match result {
-                Ok(Ok(())) => Some("Agent job created".to_string()),
-                Ok(Err(err)) => Some(format!("Create agent job failed: {err:#}")),
-                Err(err) => Some(format!("Create agent job failed: {err:#}")),
-            };
-            let _ = this.update(cx, |panel, cx| {
-                panel.action_status = status;
-                panel.refresh_project_context(cx);
-            });
-        })
-        .detach();
+        let body = serde_json::json!({ "actor_id": actor_id, "goal": goal.clone() });
+        self.check_then_create("agent_job", goal, url, body, token, cx);
     }
 
     /// Invokes the headless runtime directly — the backend calls Anthropic
@@ -1239,6 +1316,50 @@ impl ProjectBrainPanel {
                 .color(Color::Accent)
                 .into_any_element()
         })
+    }
+
+    fn render_pending_duplicate(&mut self, cx: &mut Context<Self>) -> Option<gpui::AnyElement> {
+        let pending = self.pending_duplicate.clone()?;
+        Some(
+            v_flex()
+                .gap_1p5()
+                .p_2()
+                .rounded_md()
+                .border_1()
+                .border_color(Color::Warning.color(cx))
+                .bg(cx.theme().colors().editor_background)
+                .child(
+                    Label::new(format!("This might already exist — \"{}\" looks similar to:", pending.label))
+                        .size(LabelSize::XSmall)
+                        .color(Color::Warning),
+                )
+                .children(pending.matches.iter().map(|m| {
+                    Label::new(format!("· {} ({})", m.title, m.status))
+                        .size(LabelSize::XSmall)
+                        .color(Color::Muted)
+                        .into_any_element()
+                }))
+                .child(
+                    h_flex()
+                        .gap_2()
+                        .child(
+                            Button::new("cancel-duplicate", "Cancel")
+                                .label_size(LabelSize::Small)
+                                .on_click(cx.listener(|this, _, _, cx| {
+                                    this.cancel_pending_duplicate(cx);
+                                })),
+                        )
+                        .child(
+                            Button::new("create-anyway", "Create Anyway")
+                                .label_size(LabelSize::Small)
+                                .color(Color::Accent)
+                                .on_click(cx.listener(|this, _, _, cx| {
+                                    this.confirm_pending_duplicate(cx);
+                                })),
+                        ),
+                )
+                .into_any_element(),
+        )
     }
 
     fn render_active_view(&mut self, cx: &mut Context<Self>) -> gpui::AnyElement {
@@ -2079,6 +2200,22 @@ async fn fetch_search(project_id: String, query: String) -> anyhow::Result<Searc
     Ok(body)
 }
 
+async fn fetch_similar_work(
+    project_id: String,
+    entity_type: &'static str,
+    text: String,
+) -> anyhow::Result<Vec<SimilarWorkMatch>> {
+    let url = format!("{}/projects/{}/similar-work", backend_base_url(), project_id);
+    let client = reqwest::Client::new();
+    let res = client
+        .get(&url)
+        .query(&[("entity_type", entity_type), ("text", text.as_str())])
+        .send()
+        .await?;
+    let body = res.json::<SimilarWorkResponse>().await?;
+    Ok(body.matches)
+}
+
 async fn fetch_project_context(project_id: String) -> anyhow::Result<ProjectContext> {
     let url = format!("{}/projects/{}/context", backend_base_url(), project_id);
     let client = reqwest::Client::new();
@@ -2250,6 +2387,7 @@ impl Render for ProjectBrainPanel {
             // 2. Actor onboarding — "who am I", or a form to become someone
             .child(self.render_actor_section(cx))
             .children(self.render_action_status())
+            .children(self.render_pending_duplicate(cx))
             // 3. Compact presence line — always visible regardless of which
             //    view is active, since "who's around" matters everywhere.
             .child(
