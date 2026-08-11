@@ -13,17 +13,27 @@ path = "src/project_brain_panel.rs"
 doctest = false
 
 [dependencies]
+agent_servers.workspace = true
+agent_ui.workspace = true
 anyhow.workspace = true
 async-tungstenite = { workspace = true, features = ["tokio", "tokio-rustls-manual-roots"] }
 chrono.workspace = true
+collections.workspace = true
+db.workspace = true
 editor.workspace = true
+fs.workspace = true
 futures.workspace = true
 gpui.workspace = true
 log.workspace = true
 menu.workspace = true
+project.workspace = true
 reqwest = { workspace = true, features = ["json"] }
 serde = { workspace = true, features = ["derive"] }
 serde_json.workspace = true
+settings.workspace = true
+settings_content.workspace = true
+text.workspace = true
 ui.workspace = true
+util.workspace = true
 workspace.workspace = true
 tokio = { version = "1", features = ["rt-multi-thread", "time"] }

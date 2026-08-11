@@ -115,6 +115,14 @@ impl Inlay {
         }
     }
 
+    pub fn rally_presence<T: Into<Rope>>(id: usize, position: Anchor, text: T) -> Self {
+        Self {
+            id: InlayId::RallyPresence(id),
+            position,
+            content: InlayContent::Text(text.into()),
+        }
+    }
+
     pub fn text(&self) -> &Rope {
         static COLOR_TEXT: OnceLock<Rope> = OnceLock::new();
         match &self.content {

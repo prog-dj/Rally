@@ -8,8 +8,8 @@
   // - "dark": Use the theme indicated by the "dark" field
   "theme": {
     "mode": "system",
-    "light": "One Light",
-    "dark": "One Dark",
+    "light": "Rally Light",
+    "dark": "Rally Dark",
   },
   "icon_theme": "Zed (Default)",
   // The name of a base set of key bindings to use.
@@ -560,8 +560,11 @@
     "show_user_picture": true,
     // Whether to show the user menu in the titlebar.
     "show_user_menu": true,
-    // Whether to show the sign in button in the titlebar.
-    "show_sign_in": true,
+    // Whether to show the sign in button in the titlebar. Off by default in
+    // Rally — this is stock Zed's own zed.dev collab account, unrelated to
+    // Rally's own login (see project_brain_panel), and showing both is
+    // confusing.
+    "show_sign_in": false,
     // Whether to show the menus in the titlebar.
     "show_menus": false,
     // The layout of window control buttons in the title bar (Linux only).

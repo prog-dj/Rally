@@ -1,3 +1,12 @@
+mod live_state;
+mod mcp_bridge;
+mod status_item;
+mod welcome;
+
+pub use live_state::{RallyLiveState, RallyLiveStateEvent};
+pub use status_item::RallyStatusItem;
+pub use welcome::RallyWelcome;
+
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::OnceLock;
 use std::time::Duration;
@@ -6,7 +15,7 @@ use editor::Editor;
 use futures::StreamExt;
 use gpui::{
     Action, App, AsyncApp, ClipboardItem, Context, Entity, EventEmitter, FocusHandle, Focusable,
-    IntoElement, Pixels, Render, Task, Window, px, prelude::*, WeakEntity,
+    IntoElement, Pixels, Render, Subscription, Task, Window, px, prelude::*, WeakEntity,
 };
 use serde::{Deserialize, Serialize};
 use tokio::runtime::Runtime;
@@ -100,6 +109,8 @@ pub struct PresenceEntry {
     pub actor_id: String,
     #[serde(default)]
     pub current_file: Option<String>,
+    #[serde(default)]
+    pub current_line: Option<i64>,
     #[serde(default)]
     pub current_task_id: Option<String>,
 }
@@ -280,7 +291,22 @@ enum PanelView {
     AgentJobs,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum LoginMode {
+    Login,
+    Signup,
+}
+
 pub struct ProjectBrainPanel {
+    /// Held so "Connect an agent" can launch an ACP agent session in this
+    /// same Zed window (via the real `AgentPanel`'s own connection store,
+    /// so the session shows up there like any other agent thread) instead
+    /// of only handing out a copy-paste env block.
+    workspace: WeakEntity<Workspace>,
+    /// Tracks the most recent in-app agent launch's connection state so the
+    /// panel's status line reflects success/failure instead of freezing on
+    /// "Launching…" regardless of outcome.
+    _agent_connection_subscription: Option<Subscription>,
     focus_handle: FocusHandle,
     position: DockPosition,
     active_view: PanelView,
@@ -327,6 +353,17 @@ pub struct ProjectBrainPanel {
     /// after the actor is created, so there's no way to recover it later.
     actor_token: Option<String>,
     onboarding_name_editor: Entity<Editor>,
+    /// Rally account session — set once the login/signup form below
+    /// succeeds. Distinct from `actor_id`/`actor_token`: this identifies the
+    /// *person*, which then resolves to an actor for whichever project is
+    /// open (`RALLY_PROJECT_ID`) via `/projects/:id/members`, mirroring
+    /// exactly what `rally_frontend`'s dashboard does on login.
+    session_token: Option<String>,
+    login_mode: LoginMode,
+    login_email_editor: Entity<Editor>,
+    login_password_editor: Entity<Editor>,
+    logging_in: bool,
+    login_error: Option<String>,
     /// Connecting an agent is a follow-up action a signed-in human takes,
     /// not a parallel path through the same "create actor" form — an agent
     /// doesn't decide to log in, a human provisions it. Separate state from
@@ -341,7 +378,7 @@ pub struct ProjectBrainPanel {
 }
 
 impl ProjectBrainPanel {
-    pub fn new(_workspace: &Workspace, window: &mut Window, cx: &mut Context<Self>) -> Self {
+    pub fn new(workspace: &Workspace, window: &mut Window, cx: &mut Context<Self>) -> Self {
         let steering_editor = cx.new(|cx| {
             let mut editor = Editor::single_line(window, cx);
             editor.set_placeholder_text("Steering message…", window, cx);
@@ -360,6 +397,16 @@ impl ProjectBrainPanel {
         let new_task_description_editor = cx.new(|cx| {
             let mut editor = Editor::single_line(window, cx);
             editor.set_placeholder_text("Description (optional)…", window, cx);
+            editor
+        });
+        let login_email_editor = cx.new(|cx| {
+            let mut editor = Editor::single_line(window, cx);
+            editor.set_placeholder_text("Email…", window, cx);
+            editor
+        });
+        let login_password_editor = cx.new(|cx| {
+            let mut editor = Editor::single_line(window, cx);
+            editor.set_placeholder_text("Password…", window, cx);
             editor
         });
         let onboarding_name_editor = cx.new(|cx| {
@@ -404,6 +451,8 @@ impl ProjectBrainPanel {
         });
 
         let mut this = Self {
+            workspace: workspace.weak_handle(),
+            _agent_connection_subscription: None,
             focus_handle: cx.focus_handle(),
             position: DockPosition::Right,
             active_view: PanelView::Feed,
@@ -436,12 +485,21 @@ impl ProjectBrainPanel {
             actor_id: get_actor_id(),
             actor_token: std::env::var("RALLY_ACTOR_TOKEN").ok(),
             onboarding_name_editor,
+            session_token: None,
+            login_mode: LoginMode::Login,
+            login_email_editor,
+            login_password_editor,
+            logging_in: false,
+            login_error: None,
             connecting_agent: false,
             new_agent_name_editor,
             connected_agent_config: None,
             _ws_task: None,
         };
 
+        RallyLiveState::global(cx).update(cx, |state, cx| {
+            state.set_actor_identity(this.actor_id.clone(), this.actor_token.clone(), cx)
+        });
         this.start_background_sync(cx);
         this
     }
@@ -469,7 +527,9 @@ impl ProjectBrainPanel {
 
             if let Ok(Ok(feed_data)) = feed_result {
                 let _ = this.update(cx, |panel, cx| {
-                    panel.feed_events = feed_data.events;
+                    panel.feed_events = feed_data.events.clone();
+                    RallyLiveState::global(cx)
+                        .update(cx, |state, cx| state.set_feed_events(feed_data.events, cx));
                     cx.notify();
                 });
             }
@@ -493,7 +553,8 @@ impl ProjectBrainPanel {
                 .await;
             if let Ok(Ok(actors)) = actors_result {
                 let _ = this.update(cx, |panel, cx| {
-                    panel.actors = actors;
+                    panel.actors = actors.clone();
+                    RallyLiveState::global(cx).update(cx, |state, cx| state.set_actors(actors, cx));
                     cx.notify();
                 });
             }
@@ -503,6 +564,8 @@ impl ProjectBrainPanel {
             loop {
                 let _ = this.update(cx, |panel, cx| {
                     panel.connection_status = ConnectionStatus::Connecting;
+                    RallyLiveState::global(cx)
+                        .update(cx, |state, cx| state.set_connection_status(ConnectionStatus::Connecting, cx));
                     cx.notify();
                 });
 
@@ -515,6 +578,8 @@ impl ProjectBrainPanel {
                     Ok(Ok((ws_stream, _))) => {
                         let _ = this.update(cx, |panel, cx| {
                             panel.connection_status = ConnectionStatus::Connected;
+                            RallyLiveState::global(cx)
+                                .update(cx, |state, cx| state.set_connection_status(ConnectionStatus::Connected, cx));
                             cx.notify();
                         });
 
@@ -549,6 +614,8 @@ impl ProjectBrainPanel {
 
                 let _ = this.update(cx, |panel, cx| {
                     panel.connection_status = ConnectionStatus::Disconnected;
+                    RallyLiveState::global(cx)
+                        .update(cx, |state, cx| state.set_connection_status(ConnectionStatus::Disconnected, cx));
                     cx.notify();
                 });
 
@@ -566,7 +633,8 @@ impl ProjectBrainPanel {
                 // The backend always broadcasts the full current snapshot
                 // (see PresenceStore::snapshot_project), so a plain replace
                 // is correct — anyone missing from the list is offline.
-                self.presence = actors;
+                self.presence = actors.clone();
+                RallyLiveState::global(cx).update(cx, |state, cx| state.set_presence(actors, cx));
             }
             LiveMessage::MemoryEvent { event } => {
                 self.push_feed_event(event, cx);
@@ -604,7 +672,8 @@ impl ProjectBrainPanel {
             event.id = format!("gen_{}", EVENT_COUNTER.fetch_add(1, Ordering::SeqCst));
         }
         if !self.feed_events.iter().any(|e| e.id == event.id) {
-            self.feed_events.insert(0, event);
+            self.feed_events.insert(0, event.clone());
+            RallyLiveState::global(cx).update(cx, |state, cx| state.push_feed_event(event, cx));
             cx.notify();
         }
     }
@@ -1144,6 +1213,114 @@ impl ProjectBrainPanel {
         cx.notify();
     }
 
+    fn toggle_login_mode(&mut self, cx: &mut Context<Self>) {
+        self.login_mode = match self.login_mode {
+            LoginMode::Login => LoginMode::Signup,
+            LoginMode::Signup => LoginMode::Login,
+        };
+        self.login_error = None;
+        cx.notify();
+    }
+
+    /// Logs into (or signs up for) a Rally account, then immediately
+    /// resolves this session's actor for whichever project is open —
+    /// replacing the manual create/resume flow below for anyone with an
+    /// account, the same way `rally_frontend`'s dashboard auto-provisions
+    /// on login instead of sending you through its own /join page.
+    fn submit_login(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(project_id) = get_project_id() else {
+            return;
+        };
+        let email = self.login_email_editor.read(cx).text(cx).trim().to_string();
+        let password = self.login_password_editor.read(cx).text(cx);
+        if email.is_empty() || password.is_empty() {
+            self.login_error = Some("Enter an email and password".into());
+            cx.notify();
+            return;
+        }
+        let display_name = email.clone();
+        let mode = self.login_mode;
+
+        self.logging_in = true;
+        self.login_error = None;
+        self.login_password_editor
+            .update(cx, |editor, cx| editor.clear(window, cx));
+        cx.notify();
+
+        cx.spawn(async move |this: WeakEntity<Self>, cx: &mut AsyncApp| {
+            let auth_result = tokio_runtime()
+                .spawn(async move {
+                    match mode {
+                        LoginMode::Login => login_request(email, password).await,
+                        LoginMode::Signup => signup_request(email, password, display_name).await,
+                    }
+                })
+                .await;
+
+            let session_token = match auth_result {
+                Ok(Ok(response)) => response.session_token,
+                Ok(Err(err)) => {
+                    let _ = this.update(cx, |panel, cx| {
+                        panel.logging_in = false;
+                        panel.login_error = Some(format!("{err:#}"));
+                        cx.notify();
+                    });
+                    return;
+                }
+                Err(err) => {
+                    let _ = this.update(cx, |panel, cx| {
+                        panel.logging_in = false;
+                        panel.login_error = Some(format!("{err:#}"));
+                        cx.notify();
+                    });
+                    return;
+                }
+            };
+
+            let _ = this.update(cx, |panel, cx| {
+                panel.session_token = Some(session_token.clone());
+                cx.notify();
+            });
+
+            let join_result = tokio_runtime()
+                .spawn(join_project_request(project_id, session_token))
+                .await;
+
+            let _ = this.update(cx, |panel, cx| {
+                panel.logging_in = false;
+                match join_result {
+                    Ok(Ok(response)) => {
+                        panel.actor_id = Some(response.actor.id.clone());
+                        panel.actor_token = Some(response.actor_token.clone());
+                        RallyLiveState::global(cx).update(cx, |state, cx| {
+                            state.set_actor_identity(
+                                panel.actor_id.clone(),
+                                panel.actor_token.clone(),
+                                cx,
+                            )
+                        });
+                        if !panel.actors.iter().any(|a| a.id == response.actor.id) {
+                            panel.actors.push(ActorInfo {
+                                id: response.actor.id,
+                                kind: response.actor.kind,
+                                display_name: response.actor.display_name,
+                            });
+                        }
+                        panel.action_status = Some("Signed in".into());
+                    }
+                    Ok(Err(err)) => {
+                        panel.login_error = Some(format!("Signed in, but couldn't join this project: {err:#}"));
+                    }
+                    Err(err) => {
+                        panel.login_error = Some(format!("Signed in, but couldn't join this project: {err:#}"));
+                    }
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
     /// Always creates a human actor — this form is the panel's own
     /// onboarding, gone through by the human sitting at this session. An
     /// agent never goes through this; see submit_connect_agent below.
@@ -1174,6 +1351,13 @@ impl ProjectBrainPanel {
                     Ok(Ok(response)) => {
                         panel.actor_id = Some(response.id.clone());
                         panel.actor_token = Some(response.token.clone());
+                        RallyLiveState::global(cx).update(cx, |state, cx| {
+                            state.set_actor_identity(
+                                panel.actor_id.clone(),
+                                panel.actor_token.clone(),
+                                cx,
+                            )
+                        });
                         panel.actors.push(ActorInfo {
                             id: response.id,
                             kind: response.kind,
@@ -1244,6 +1428,13 @@ impl ProjectBrainPanel {
                             response.id,
                             response.token,
                         );
+                        crate::mcp_bridge::register_rally_context_server(
+                            cx,
+                            backend_base_url(),
+                            project_id.clone(),
+                            response.id.clone(),
+                            response.token.clone(),
+                        );
                         panel.actors.push(ActorInfo {
                             id: response.id,
                             kind: response.kind,
@@ -1267,6 +1458,86 @@ impl ProjectBrainPanel {
             });
         })
         .detach();
+    }
+
+    /// ACP agent servers already configured in this Zed instance
+    /// (`agent_id`, `display_name`) — whatever `Rally MCP` credentials were
+    /// just registered in Step 1 apply automatically to any of these once
+    /// launched, since `mcp_servers_for_project` reads from the same
+    /// project-wide context-server settings regardless of which agent
+    /// connects.
+    fn available_agent_servers(&self, cx: &App) -> Vec<(String, String)> {
+        let Some(workspace) = self.workspace.upgrade() else {
+            return Vec::new();
+        };
+        let project = workspace.read(cx).project().clone();
+        let store = project.read(cx).agent_server_store().read(cx);
+        store
+            .external_agents()
+            .map(|id| {
+                let name = store
+                    .agent_display_name(id)
+                    .map(|s| s.to_string())
+                    .unwrap_or_else(|| id.0.to_string());
+                (id.0.to_string(), name)
+            })
+            .collect()
+    }
+
+    /// Starts a live ACP session with `agent_id` in this same Zed window,
+    /// via the real `AgentPanel`'s own `AgentConnectionStore` so the
+    /// resulting thread shows up there like any other agent session — no
+    /// copy-paste, no second process.
+    fn launch_agent_in_zed(&mut self, agent_id: String, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(workspace) = self.workspace.upgrade() else {
+            self.action_status = Some("No workspace available to launch an agent in".into());
+            cx.notify();
+            return;
+        };
+        let Some(agent_panel) = workspace.read(cx).panel::<agent_ui::AgentPanel>(cx) else {
+            self.action_status =
+                Some("Open Zed's Agent panel once first, then retry connecting".into());
+            cx.notify();
+            return;
+        };
+
+        let connection_store = agent_panel.read(cx).connection_store().clone();
+        let key = agent_ui::Agent::Custom {
+            id: project::agent_server_store::AgentId::new(agent_id.clone()),
+        };
+        let server: std::rc::Rc<dyn agent_servers::AgentServer> = std::rc::Rc::new(
+            agent_servers::CustomAgentServer::new(project::agent_server_store::AgentId::new(
+                agent_id,
+            )),
+        );
+        // `restart_connection` (not `request_connection`) so re-clicking
+        // "Launch" after a failed/stale attempt actually retries instead of
+        // silently reattaching to a dead entry forever.
+        let entry = connection_store.update(cx, |store, cx| {
+            store.restart_connection(key, server, cx)
+        });
+
+        workspace.update(cx, |workspace, cx| {
+            workspace.focus_panel::<agent_ui::AgentPanel>(window, cx);
+        });
+
+        self.action_status = Some("Launching agent in Zed…".into());
+        self._agent_connection_subscription = Some(cx.observe(&entry, |this, entry, cx| {
+            use agent_ui::agent_connection_store::AgentConnectionEntry;
+            this.action_status = Some(match entry.read(cx) {
+                AgentConnectionEntry::Connecting { .. } => {
+                    "Agent connecting in Zed…".to_string()
+                }
+                AgentConnectionEntry::Connected(_) => {
+                    "Agent connected in Zed — see the Agent panel".to_string()
+                }
+                AgentConnectionEntry::Error { error } => {
+                    format!("Agent launch failed: {error}")
+                }
+            });
+            cx.notify();
+        }));
+        cx.notify();
     }
 
     fn display_name_for(&self, actor_id: &str) -> String {
@@ -2150,7 +2421,36 @@ impl ProjectBrainPanel {
                                         cx.notify();
                                     }
                                 })),
-                        ),
+                        )
+                        .children({
+                            let available = self.available_agent_servers(cx);
+                            if available.is_empty() {
+                                vec![
+                                    Label::new(
+                                        "No ACP agents configured in Zed yet — the config above still works for any external MCP client.",
+                                    )
+                                    .size(LabelSize::XSmall)
+                                    .color(Color::Muted)
+                                    .into_any_element(),
+                                ]
+                            } else {
+                                available
+                                    .into_iter()
+                                    .map(|(id, name)| {
+                                        Button::new(
+                                            SharedString::from(format!("launch-agent-{id}")),
+                                            format!("Launch {name} in Zed now"),
+                                        )
+                                        .label_size(LabelSize::Small)
+                                        .color(Color::Accent)
+                                        .on_click(cx.listener(move |this, _, window, cx| {
+                                            this.launch_agent_in_zed(id.clone(), window, cx);
+                                        }))
+                                        .into_any_element()
+                                    })
+                                    .collect::<Vec<_>>()
+                            }
+                        }),
                 );
             }
 
@@ -2158,31 +2458,106 @@ impl ProjectBrainPanel {
         }
 
         v_flex()
-            .gap_1p5()
-            .p_2()
-            .rounded_md()
-            .bg(cx.theme().colors().element_background)
+            .gap_2()
             .child(
-                Label::new("CREATE YOUR ACTOR")
-                    .size(LabelSize::XSmall)
-                    .color(Color::Muted),
-            )
-            .child(
-                div()
+                v_flex()
+                    .gap_1p5()
+                    .p_2()
                     .rounded_md()
-                    .border_1()
-                    .border_color(cx.theme().colors().border)
-                    .px_2()
-                    .py_1()
-                    .child(self.onboarding_name_editor.clone()),
+                    .bg(cx.theme().colors().element_background)
+                    .child(
+                        h_flex().justify_between().items_center().child(
+                            Label::new(match self.login_mode {
+                                LoginMode::Login => "LOG IN TO RALLY",
+                                LoginMode::Signup => "CREATE A RALLY ACCOUNT",
+                            })
+                            .size(LabelSize::XSmall)
+                            .color(Color::Muted),
+                        ).child(
+                            Button::new(
+                                "toggle-login-mode",
+                                match self.login_mode {
+                                    LoginMode::Login => "Need an account?",
+                                    LoginMode::Signup => "Have an account?",
+                                },
+                            )
+                            .label_size(LabelSize::XSmall)
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.toggle_login_mode(cx);
+                            })),
+                        ),
+                    )
+                    .child(
+                        div()
+                            .rounded_md()
+                            .border_1()
+                            .border_color(cx.theme().colors().border)
+                            .px_2()
+                            .py_1()
+                            .child(self.login_email_editor.clone()),
+                    )
+                    .child(
+                        div()
+                            .rounded_md()
+                            .border_1()
+                            .border_color(cx.theme().colors().border)
+                            .px_2()
+                            .py_1()
+                            .child(self.login_password_editor.clone()),
+                    )
+                    .when_some(self.login_error.clone(), |this, error| {
+                        this.child(
+                            Label::new(error)
+                                .size(LabelSize::XSmall)
+                                .color(Color::Error),
+                        )
+                    })
+                    .child(
+                        Button::new(
+                            "submit-login",
+                            if self.logging_in {
+                                "Please wait…"
+                            } else {
+                                match self.login_mode {
+                                    LoginMode::Login => "Log in",
+                                    LoginMode::Signup => "Create account",
+                                }
+                            },
+                        )
+                        .label_size(LabelSize::Small)
+                        .color(Color::Accent)
+                        .on_click(cx.listener(|this, _, window, cx| {
+                            this.submit_login(window, cx);
+                        })),
+                    ),
             )
             .child(
-                Button::new("create-actor", "Create Actor")
-                    .label_size(LabelSize::Small)
-                    .color(Color::Accent)
-                    .on_click(cx.listener(|this, _, window, cx| {
-                        this.submit_create_actor(window, cx);
-                    })),
+                v_flex()
+                    .gap_1p5()
+                    .p_2()
+                    .rounded_md()
+                    .bg(cx.theme().colors().element_background)
+                    .child(
+                        Label::new("OR CONNECT WITHOUT AN ACCOUNT")
+                            .size(LabelSize::XSmall)
+                            .color(Color::Muted),
+                    )
+                    .child(
+                        div()
+                            .rounded_md()
+                            .border_1()
+                            .border_color(cx.theme().colors().border)
+                            .px_2()
+                            .py_1()
+                            .child(self.onboarding_name_editor.clone()),
+                    )
+                    .child(
+                        Button::new("create-actor", "Create Actor")
+                            .label_size(LabelSize::Small)
+                            .on_click(cx.listener(|this, _, window, cx| {
+                                this.submit_create_actor(window, cx);
+                            })),
+                    ),
             )
             .into_any_element()
     }
@@ -2259,6 +2634,86 @@ async fn create_actor_request(
     }
     let body = res.json::<CreateActorResponse>().await?;
     Ok(body)
+}
+
+/// Only the field the panel actually needs from `/auth/login` /
+/// `/auth/signup` — extra fields (e.g. `user`) are ignored by default.
+#[derive(Debug, Deserialize)]
+struct AuthSessionResponse {
+    session_token: String,
+}
+
+async fn login_request(email: String, password: String) -> anyhow::Result<AuthSessionResponse> {
+    let url = format!("{}/auth/login", backend_base_url());
+    let client = reqwest::Client::new();
+    let res = client
+        .post(&url)
+        .json(&serde_json::json!({ "email": email, "password": password }))
+        .send()
+        .await?;
+    if !res.status().is_success() {
+        let status = res.status();
+        let text = res.text().await.unwrap_or_default();
+        anyhow::bail!("{status}: {text}");
+    }
+    Ok(res.json::<AuthSessionResponse>().await?)
+}
+
+async fn signup_request(
+    email: String,
+    password: String,
+    display_name: String,
+) -> anyhow::Result<AuthSessionResponse> {
+    let url = format!("{}/auth/signup", backend_base_url());
+    let client = reqwest::Client::new();
+    let res = client
+        .post(&url)
+        .json(&serde_json::json!({
+            "email": email,
+            "password": password,
+            "display_name": display_name,
+        }))
+        .send()
+        .await?;
+    if !res.status().is_success() {
+        let status = res.status();
+        let text = res.text().await.unwrap_or_default();
+        anyhow::bail!("{status}: {text}");
+    }
+    Ok(res.json::<AuthSessionResponse>().await?)
+}
+
+/// Mirrors the backend's `/projects/:id/members` response shape closely
+/// enough for the panel's purposes — same fields `CreateActorResponse`
+/// already mirrors, just without the `token` rename.
+#[derive(Debug, Deserialize)]
+struct SessionActor {
+    id: String,
+    kind: String,
+    display_name: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct JoinProjectResponse {
+    actor: SessionActor,
+    actor_token: String,
+}
+
+/// Idempotent — get-or-create this session's actor for `project_id`, the
+/// same call `rally_frontend`'s dashboard makes on login.
+async fn join_project_request(
+    project_id: String,
+    session_token: String,
+) -> anyhow::Result<JoinProjectResponse> {
+    let url = format!("{}/projects/{}/members", backend_base_url(), project_id);
+    let client = reqwest::Client::new();
+    let res = client.post(&url).bearer_auth(session_token).send().await?;
+    if !res.status().is_success() {
+        let status = res.status();
+        let text = res.text().await.unwrap_or_default();
+        anyhow::bail!("{status}: {text}");
+    }
+    Ok(res.json::<JoinProjectResponse>().await?)
 }
 
 async fn post_json(url: String, body: serde_json::Value, token: Option<String>) -> anyhow::Result<()> {
@@ -2472,6 +2927,8 @@ fn format_relative_time(dt: Option<DateTime<Utc>>) -> String {
 }
 
 pub fn init(cx: &mut App) {
+    live_state::init(cx);
+    welcome::init(cx);
     cx.observe_new(
         |workspace: &mut Workspace, window, cx: &mut Context<Workspace>| {
             workspace.register_action(|workspace, _: &ToggleProjectBrainPanel, window, cx| {

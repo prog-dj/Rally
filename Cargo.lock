@@ -14208,18 +14208,28 @@ dependencies = [
 name = "project_brain_panel"
 version = "0.1.0"
 dependencies = [
+ "agent_servers",
+ "agent_ui",
  "anyhow",
  "async-tungstenite",
  "chrono",
+ "collections",
+ "db",
  "editor",
+ "fs",
  "futures 0.3.32",
  "gpui",
  "log",
  "menu",
+ "project",
  "serde",
  "serde_json",
+ "settings",
+ "settings_content",
+ "text",
  "tokio",
  "ui",
+ "util",
  "workspace",
  "zed-reqwest",
 ]

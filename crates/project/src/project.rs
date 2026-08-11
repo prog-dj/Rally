@@ -491,6 +491,9 @@ pub enum InlayId {
     Hint(usize),
     Color(usize),
     ReplResult(usize),
+    /// A live collaborator/agent presence marker — driven by Rally's own
+    /// presence data, not LSP, git, or the debugger.
+    RallyPresence(usize),
 }
 
 impl InlayId {
@@ -501,6 +504,7 @@ impl InlayId {
             Self::Hint(id) => *id,
             Self::Color(id) => *id,
             Self::ReplResult(id) => *id,
+            Self::RallyPresence(id) => *id,
         }
     }
 }
