@@ -299,7 +299,16 @@ pub struct ProjectBrainPanel {
     /// after the actor is created, so there's no way to recover it later.
     actor_token: Option<String>,
     onboarding_name_editor: Entity<Editor>,
-    onboarding_kind_is_agent: bool,
+    /// Connecting an agent is a follow-up action a signed-in human takes,
+    /// not a parallel path through the same "create actor" form — an agent
+    /// doesn't decide to log in, a human provisions it. Separate state from
+    /// onboarding_name_editor on purpose.
+    connecting_agent: bool,
+    new_agent_name_editor: Entity<Editor>,
+    /// The env-var block to hand to whatever will act as the agent, once
+    /// created. Shown once, same as a token — the backend never returns it
+    /// again after this.
+    connected_agent_config: Option<String>,
     _ws_task: Option<Task<()>>,
 }
 
@@ -328,6 +337,11 @@ impl ProjectBrainPanel {
         let onboarding_name_editor = cx.new(|cx| {
             let mut editor = Editor::single_line(window, cx);
             editor.set_placeholder_text("Your name…", window, cx);
+            editor
+        });
+        let new_agent_name_editor = cx.new(|cx| {
+            let mut editor = Editor::single_line(window, cx);
+            editor.set_placeholder_text("e.g. Claude Code, CI Bot…", window, cx);
             editor
         });
         let new_investigation_title_editor = cx.new(|cx| {
@@ -393,7 +407,9 @@ impl ProjectBrainPanel {
             actor_id: get_actor_id(),
             actor_token: std::env::var("RALLY_ACTOR_TOKEN").ok(),
             onboarding_name_editor,
-            onboarding_kind_is_agent: false,
+            connecting_agent: false,
+            new_agent_name_editor,
+            connected_agent_config: None,
             _ws_task: None,
         };
 
@@ -1051,11 +1067,9 @@ impl ProjectBrainPanel {
         cx.notify();
     }
 
-    fn toggle_onboarding_kind(&mut self, cx: &mut Context<Self>) {
-        self.onboarding_kind_is_agent = !self.onboarding_kind_is_agent;
-        cx.notify();
-    }
-
+    /// Always creates a human actor — this form is the panel's own
+    /// onboarding, gone through by the human sitting at this session. An
+    /// agent never goes through this; see submit_connect_agent below.
     fn submit_create_actor(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let Some(project_id) = get_project_id() else {
             return;
@@ -1071,18 +1085,12 @@ impl ProjectBrainPanel {
             cx.notify();
             return;
         }
-        let kind = if self.onboarding_kind_is_agent {
-            "agent"
-        } else {
-            "human"
-        }
-        .to_string();
         self.onboarding_name_editor
             .update(cx, |editor, cx| editor.clear(window, cx));
 
         cx.spawn(async move |this: WeakEntity<Self>, cx: &mut AsyncApp| {
             let result = tokio_runtime()
-                .spawn(create_actor_request(project_id, display_name, kind))
+                .spawn(create_actor_request(project_id, display_name, "human".to_string()))
                 .await;
             let _ = this.update(cx, |panel, cx| {
                 match result {
@@ -1105,6 +1113,77 @@ impl ProjectBrainPanel {
                     }
                     Err(err) => {
                         panel.action_status = Some(format!("Create actor failed: {err:#}"));
+                    }
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    fn toggle_connect_agent_form(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.connecting_agent = !self.connecting_agent;
+        if self.connecting_agent {
+            self.new_agent_name_editor
+                .update(cx, |editor, cx| editor.clear(window, cx));
+            self.new_agent_name_editor.focus_handle(cx).focus(window, cx);
+        }
+        cx.notify();
+    }
+
+    /// Connecting an agent is a human's follow-up action, not a parallel
+    /// onboarding path — an agent doesn't sign in, it gets provisioned.
+    /// The result isn't "you're in," it's a config block to hand to
+    /// whatever will actually act as this agent (hooks, MCP, a CI secret).
+    fn submit_connect_agent(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(project_id) = get_project_id() else {
+            return;
+        };
+        let name = self
+            .new_agent_name_editor
+            .read(cx)
+            .text(cx)
+            .trim()
+            .to_string();
+        if name.is_empty() {
+            self.action_status = Some("Enter a name before connecting an agent".into());
+            cx.notify();
+            return;
+        }
+        self.new_agent_name_editor
+            .update(cx, |editor, cx| editor.clear(window, cx));
+
+        cx.spawn(async move |this: WeakEntity<Self>, cx: &mut AsyncApp| {
+            let result = tokio_runtime()
+                .spawn(create_actor_request(project_id.clone(), name, "agent".to_string()))
+                .await;
+            let _ = this.update(cx, |panel, cx| {
+                match result {
+                    Ok(Ok(response)) => {
+                        let config = format!(
+                            "RALLY_BACKEND_URL={}\nRALLY_PROJECT_ID={}\nRALLY_ACTOR_ID={}\nRALLY_ACTOR_TOKEN={}",
+                            backend_base_url(),
+                            project_id,
+                            response.id,
+                            response.token,
+                        );
+                        panel.actors.push(ActorInfo {
+                            id: response.id,
+                            kind: response.kind,
+                            display_name: response.display_name,
+                        });
+                        cx.write_to_clipboard(ClipboardItem::new_string(config.clone()));
+                        panel.connected_agent_config = Some(config);
+                        panel.connecting_agent = false;
+                        panel.action_status = Some(
+                            "Agent connected — config copied to clipboard, shown only once".into(),
+                        );
+                    }
+                    Ok(Err(err)) => {
+                        panel.action_status = Some(format!("Connect agent failed: {err:#}"));
+                    }
+                    Err(err) => {
+                        panel.action_status = Some(format!("Connect agent failed: {err:#}"));
                     }
                 }
                 cx.notify();
@@ -1848,28 +1927,113 @@ impl ProjectBrainPanel {
     fn render_actor_section(&mut self, cx: &mut Context<Self>) -> gpui::AnyElement {
         if let Some(actor_id) = self.actor_id.clone() {
             let name = self.display_name_for(&actor_id);
-            let mut row = h_flex()
-                .justify_between()
-                .items_center()
-                .child(
-                    Label::new(format!("Signed in as {name}"))
-                        .size(LabelSize::XSmall)
-                        .color(Color::Muted),
-                );
-            if self.actor_token.is_some() {
-                row = row.child(
-                    Button::new("copy-actor-token", "Copy Token")
-                        .label_size(LabelSize::Small)
-                        .on_click(cx.listener(|this, _, _, cx| {
-                            if let Some(token) = this.actor_token.clone() {
-                                cx.write_to_clipboard(ClipboardItem::new_string(token));
-                                this.action_status = Some("Token copied to clipboard".into());
-                                cx.notify();
-                            }
-                        })),
+            let mut root = v_flex().gap_1p5().child(
+                h_flex()
+                    .justify_between()
+                    .items_center()
+                    .child(
+                        Label::new(format!("Signed in as {name}"))
+                            .size(LabelSize::XSmall)
+                            .color(Color::Muted),
+                    )
+                    .child(
+                        h_flex()
+                            .gap_2()
+                            .when(self.actor_token.is_some(), |this| {
+                                this.child(
+                                    Button::new("copy-actor-token", "Copy Token")
+                                        .label_size(LabelSize::Small)
+                                        .on_click(cx.listener(|this, _, _, cx| {
+                                            if let Some(token) = this.actor_token.clone() {
+                                                cx.write_to_clipboard(ClipboardItem::new_string(token));
+                                                this.action_status =
+                                                    Some("Token copied to clipboard".into());
+                                                cx.notify();
+                                            }
+                                        })),
+                                )
+                            })
+                            .child(
+                                Button::new(
+                                    "toggle-connect-agent",
+                                    if self.connecting_agent { "Cancel" } else { "+ Connect Agent" },
+                                )
+                                .label_size(LabelSize::Small)
+                                .on_click(cx.listener(|this, _, window, cx| {
+                                    this.toggle_connect_agent_form(window, cx);
+                                })),
+                            ),
+                    ),
+            );
+
+            if self.connecting_agent {
+                root = root.child(
+                    v_flex()
+                        .gap_1p5()
+                        .p_2()
+                        .rounded_md()
+                        .bg(cx.theme().colors().editor_background)
+                        .child(
+                            Label::new(
+                                "An agent doesn't sign in — you're provisioning it. This creates a separate agent actor and gives you a config block to hand it (hooks, MCP, or a CI secret).",
+                            )
+                            .size(LabelSize::XSmall)
+                            .color(Color::Muted),
+                        )
+                        .child(
+                            div()
+                                .rounded_md()
+                                .border_1()
+                                .border_color(cx.theme().colors().border)
+                                .px_2()
+                                .py_1()
+                                .child(self.new_agent_name_editor.clone()),
+                        )
+                        .child(
+                            Button::new("connect-agent", "Connect")
+                                .label_size(LabelSize::Small)
+                                .color(Color::Accent)
+                                .on_click(cx.listener(|this, _, window, cx| {
+                                    this.submit_connect_agent(window, cx);
+                                })),
+                        ),
                 );
             }
-            return row.into_any_element();
+
+            if let Some(config) = self.connected_agent_config.clone() {
+                root = root.child(
+                    v_flex()
+                        .gap_1()
+                        .p_2()
+                        .rounded_md()
+                        .bg(cx.theme().colors().editor_background)
+                        .child(
+                            Label::new("Give this to the agent — shown once")
+                                .size(LabelSize::XSmall)
+                                .color(Color::Warning),
+                        )
+                        .child(
+                            div()
+                                .rounded_md()
+                                .bg(cx.theme().colors().editor_background)
+                                .p_1()
+                                .child(Label::new(config).size(LabelSize::XSmall).color(Color::Muted)),
+                        )
+                        .child(
+                            Button::new("copy-agent-config", "Copy Config")
+                                .label_size(LabelSize::Small)
+                                .on_click(cx.listener(|this, _, _, cx| {
+                                    if let Some(config) = this.connected_agent_config.clone() {
+                                        cx.write_to_clipboard(ClipboardItem::new_string(config));
+                                        this.action_status = Some("Config copied to clipboard".into());
+                                        cx.notify();
+                                    }
+                                })),
+                        ),
+                );
+            }
+
+            return root.into_any_element();
         }
 
         v_flex()
@@ -1892,30 +2056,12 @@ impl ProjectBrainPanel {
                     .child(self.onboarding_name_editor.clone()),
             )
             .child(
-                h_flex()
-                    .gap_2()
-                    .child(
-                        Button::new(
-                            "onboarding-kind",
-                            if self.onboarding_kind_is_agent {
-                                "Kind: Agent"
-                            } else {
-                                "Kind: Human"
-                            },
-                        )
-                        .label_size(LabelSize::Small)
-                        .on_click(cx.listener(|this, _, _, cx| {
-                            this.toggle_onboarding_kind(cx);
-                        })),
-                    )
-                    .child(
-                        Button::new("create-actor", "Create Actor")
-                            .label_size(LabelSize::Small)
-                            .color(Color::Accent)
-                            .on_click(cx.listener(|this, _, window, cx| {
-                                this.submit_create_actor(window, cx);
-                            })),
-                    ),
+                Button::new("create-actor", "Create Actor")
+                    .label_size(LabelSize::Small)
+                    .color(Color::Accent)
+                    .on_click(cx.listener(|this, _, window, cx| {
+                        this.submit_create_actor(window, cx);
+                    })),
             )
             .into_any_element()
     }
