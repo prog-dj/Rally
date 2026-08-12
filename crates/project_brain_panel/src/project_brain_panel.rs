@@ -289,6 +289,16 @@ enum PanelView {
     Investigations,
     Decisions,
     AgentJobs,
+    Projects,
+}
+
+/// Mirrors the backend's `Project` row, trimmed to what the switcher
+/// needs — extra fields (created_at, the encrypted BYOK key columns, etc.)
+/// are simply ignored by serde since this doesn't set deny_unknown_fields.
+#[derive(Clone, Debug, Deserialize)]
+pub struct ProjectSummary {
+    pub id: String,
+    pub name: String,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -375,6 +385,16 @@ pub struct ProjectBrainPanel {
     /// again after this.
     connected_agent_config: Option<String>,
     _ws_task: Option<Task<()>>,
+    /// The project this session is currently scoped to — seeded from
+    /// `RALLY_PROJECT_ID` at construction, then mutable via the Projects
+    /// tab's switcher. Kept as a field (rather than re-reading the env var
+    /// everywhere) so switching projects can actually change it.
+    project_id: Option<String>,
+    my_projects: Vec<ProjectSummary>,
+    loading_projects: bool,
+    projects_error: Option<String>,
+    new_project_name_editor: Entity<Editor>,
+    creating_project: bool,
 }
 
 impl ProjectBrainPanel {
@@ -449,6 +469,11 @@ impl ProjectBrainPanel {
             editor.set_placeholder_text("What should this agent job do?", window, cx);
             editor
         });
+        let new_project_name_editor = cx.new(|cx| {
+            let mut editor = Editor::single_line(window, cx);
+            editor.set_placeholder_text("New project name…", window, cx);
+            editor
+        });
 
         let mut this = Self {
             workspace: workspace.weak_handle(),
@@ -495,6 +520,12 @@ impl ProjectBrainPanel {
             new_agent_name_editor,
             connected_agent_config: None,
             _ws_task: None,
+            project_id: get_project_id(),
+            my_projects: Vec::new(),
+            loading_projects: false,
+            projects_error: None,
+            new_project_name_editor,
+            creating_project: false,
         };
 
         RallyLiveState::global(cx).update(cx, |state, cx| {
@@ -505,11 +536,12 @@ impl ProjectBrainPanel {
     }
 
     fn start_background_sync(&mut self, cx: &mut Context<Self>) {
+        let project_id = self.project_id.clone();
         let task = cx.spawn(async move |this: WeakEntity<Self>, cx: &mut AsyncApp| {
             // 1. Fetch initial feed history (run on the Tokio runtime, since
             //    reqwest needs a real Tokio reactor for DNS/networking).
-            let Some(project_id) = get_project_id() else {
-                log::error!("RALLY_PROJECT_ID is not set. Project Brain cannot connect.");
+            let Some(project_id) = project_id else {
+                log::error!("No project selected. Project Brain cannot connect.");
                 return;
             };
 
@@ -648,7 +680,7 @@ impl ProjectBrainPanel {
                 self.push_feed_event(
                     FeedEvent {
                         id: event_id,
-                        project_id: get_project_id(),
+                        project_id: self.project_id.clone(),
                         actor_id: job.claimed_by_actor_id.clone(),
                         entity_type: Some("agent_job".to_string()),
                         entity_id: Some(job.id.clone()),
@@ -679,7 +711,7 @@ impl ProjectBrainPanel {
     }
 
     fn refresh_project_context(&mut self, cx: &mut Context<Self>) {
-        let Some(project_id) = get_project_id() else {
+        let Some(project_id) = self.project_id.clone() else {
             return;
         };
         cx.spawn(async move |this: WeakEntity<Self>, cx: &mut AsyncApp| {
@@ -789,7 +821,7 @@ impl ProjectBrainPanel {
             cx.notify();
             return;
         }
-        let Some(project_id) = get_project_id() else {
+        let Some(project_id) = self.project_id.clone() else {
             return;
         };
         cx.spawn(async move |this: WeakEntity<Self>, cx: &mut AsyncApp| {
@@ -832,7 +864,7 @@ impl ProjectBrainPanel {
             return;
         };
         let token = self.actor_token.clone();
-        let Some(project_id) = get_project_id() else {
+        let Some(project_id) = self.project_id.clone() else {
             return;
         };
         let title = self.new_task_title_editor.read(cx).text(cx).trim().to_string();
@@ -876,7 +908,7 @@ impl ProjectBrainPanel {
         token: Option<String>,
         cx: &mut Context<Self>,
     ) {
-        let Some(project_id) = get_project_id() else {
+        let Some(project_id) = self.project_id.clone() else {
             return;
         };
         let check_text = label.clone();
@@ -990,7 +1022,7 @@ impl ProjectBrainPanel {
             return;
         };
         let token = self.actor_token.clone();
-        let Some(project_id) = get_project_id() else {
+        let Some(project_id) = self.project_id.clone() else {
             return;
         };
         let title = self
@@ -1058,7 +1090,7 @@ impl ProjectBrainPanel {
             return;
         };
         let token = self.actor_token.clone();
-        let Some(project_id) = get_project_id() else {
+        let Some(project_id) = self.project_id.clone() else {
             return;
         };
         let title = self.new_decision_title_editor.read(cx).text(cx).trim().to_string();
@@ -1124,7 +1156,7 @@ impl ProjectBrainPanel {
             return;
         };
         let token = self.actor_token.clone();
-        let Some(project_id) = get_project_id() else {
+        let Some(project_id) = self.project_id.clone() else {
             return;
         };
         let goal = self.new_agent_job_goal_editor.read(cx).text(cx).trim().to_string();
@@ -1228,9 +1260,7 @@ impl ProjectBrainPanel {
     /// account, the same way `rally_frontend`'s dashboard auto-provisions
     /// on login instead of sending you through its own /join page.
     fn submit_login(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(project_id) = get_project_id() else {
-            return;
-        };
+        let project_id = self.project_id.clone();
         let email = self.login_email_editor.read(cx).text(cx).trim().to_string();
         let password = self.login_password_editor.read(cx).text(cx);
         if email.is_empty() || password.is_empty() {
@@ -1282,39 +1312,49 @@ impl ProjectBrainPanel {
                 cx.notify();
             });
 
-            let join_result = tokio_runtime()
-                .spawn(join_project_request(project_id, session_token))
-                .await;
+            if let Some(project_id) = project_id {
+                let join_result = tokio_runtime()
+                    .spawn(join_project_request(project_id, session_token.clone()))
+                    .await;
+
+                let _ = this.update(cx, |panel, cx| {
+                    match join_result {
+                        Ok(Ok(response)) => {
+                            panel.actor_id = Some(response.actor.id.clone());
+                            panel.actor_token = Some(response.actor_token.clone());
+                            RallyLiveState::global(cx).update(cx, |state, cx| {
+                                state.set_actor_identity(
+                                    panel.actor_id.clone(),
+                                    panel.actor_token.clone(),
+                                    cx,
+                                )
+                            });
+                            if !panel.actors.iter().any(|a| a.id == response.actor.id) {
+                                panel.actors.push(ActorInfo {
+                                    id: response.actor.id,
+                                    kind: response.actor.kind,
+                                    display_name: response.actor.display_name,
+                                });
+                            }
+                            panel.action_status = Some("Signed in".into());
+                        }
+                        Ok(Err(err)) => {
+                            panel.login_error = Some(format!("Signed in, but couldn't join this project: {err:#}"));
+                        }
+                        Err(err) => {
+                            panel.login_error = Some(format!("Signed in, but couldn't join this project: {err:#}"));
+                        }
+                    }
+                });
+            } else {
+                let _ = this.update(cx, |panel, _cx| {
+                    panel.action_status = Some("Signed in — open the Projects tab to pick or create a project".into());
+                });
+            }
 
             let _ = this.update(cx, |panel, cx| {
                 panel.logging_in = false;
-                match join_result {
-                    Ok(Ok(response)) => {
-                        panel.actor_id = Some(response.actor.id.clone());
-                        panel.actor_token = Some(response.actor_token.clone());
-                        RallyLiveState::global(cx).update(cx, |state, cx| {
-                            state.set_actor_identity(
-                                panel.actor_id.clone(),
-                                panel.actor_token.clone(),
-                                cx,
-                            )
-                        });
-                        if !panel.actors.iter().any(|a| a.id == response.actor.id) {
-                            panel.actors.push(ActorInfo {
-                                id: response.actor.id,
-                                kind: response.actor.kind,
-                                display_name: response.actor.display_name,
-                            });
-                        }
-                        panel.action_status = Some("Signed in".into());
-                    }
-                    Ok(Err(err)) => {
-                        panel.login_error = Some(format!("Signed in, but couldn't join this project: {err:#}"));
-                    }
-                    Err(err) => {
-                        panel.login_error = Some(format!("Signed in, but couldn't join this project: {err:#}"));
-                    }
-                }
+                panel.refresh_my_projects(cx);
                 cx.notify();
             });
         })
@@ -1325,7 +1365,7 @@ impl ProjectBrainPanel {
     /// onboarding, gone through by the human sitting at this session. An
     /// agent never goes through this; see submit_connect_agent below.
     fn submit_create_actor(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(project_id) = get_project_id() else {
+        let Some(project_id) = self.project_id.clone() else {
             return;
         };
         let display_name = self
@@ -1341,10 +1381,16 @@ impl ProjectBrainPanel {
         }
         self.onboarding_name_editor
             .update(cx, |editor, cx| editor.clear(window, cx));
+        let session_token = self.session_token.clone();
 
         cx.spawn(async move |this: WeakEntity<Self>, cx: &mut AsyncApp| {
             let result = tokio_runtime()
-                .spawn(create_actor_request(project_id, display_name, "human".to_string()))
+                .spawn(create_actor_request(
+                    project_id,
+                    display_name,
+                    "human".to_string(),
+                    session_token,
+                ))
                 .await;
             let _ = this.update(cx, |panel, cx| {
                 match result {
@@ -1397,7 +1443,7 @@ impl ProjectBrainPanel {
     /// The result isn't "you're in," it's a config block to hand to
     /// whatever will actually act as this agent (hooks, MCP, a CI secret).
     fn submit_connect_agent(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(project_id) = get_project_id() else {
+        let Some(project_id) = self.project_id.clone() else {
             return;
         };
         let name = self
@@ -1413,10 +1459,16 @@ impl ProjectBrainPanel {
         }
         self.new_agent_name_editor
             .update(cx, |editor, cx| editor.clear(window, cx));
+        let session_token = self.session_token.clone();
 
         cx.spawn(async move |this: WeakEntity<Self>, cx: &mut AsyncApp| {
             let result = tokio_runtime()
-                .spawn(create_actor_request(project_id.clone(), name, "agent".to_string()))
+                .spawn(create_actor_request(
+                    project_id.clone(),
+                    name,
+                    "agent".to_string(),
+                    session_token,
+                ))
                 .await;
             let _ = this.update(cx, |panel, cx| {
                 match result {
@@ -1550,16 +1602,204 @@ impl ProjectBrainPanel {
 
     fn set_active_view(&mut self, view: PanelView, cx: &mut Context<Self>) {
         self.active_view = view;
+        if view == PanelView::Projects && self.session_token.is_some() {
+            self.refresh_my_projects(cx);
+        }
         cx.notify();
     }
 
+    fn refresh_my_projects(&mut self, cx: &mut Context<Self>) {
+        let Some(session_token) = self.session_token.clone() else {
+            return;
+        };
+        self.loading_projects = true;
+        self.projects_error = None;
+        cx.notify();
+        cx.spawn(async move |this: WeakEntity<Self>, cx: &mut AsyncApp| {
+            let result = tokio_runtime()
+                .spawn(list_my_projects_request(session_token))
+                .await;
+            let _ = this.update(cx, |panel, cx| {
+                panel.loading_projects = false;
+                match result {
+                    Ok(Ok(projects)) => {
+                        panel.my_projects = projects;
+                        panel.projects_error = None;
+                    }
+                    Ok(Err(err)) => {
+                        panel.projects_error = Some(format!("{err:#}"));
+                    }
+                    Err(err) => {
+                        panel.projects_error = Some(format!("{err:#}"));
+                    }
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    fn toggle_create_project_form(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.creating_project = !self.creating_project;
+        if self.creating_project {
+            self.new_project_name_editor
+                .update(cx, |editor, cx| editor.clear(window, cx));
+            self.new_project_name_editor.focus_handle(cx).focus(window, cx);
+        }
+        cx.notify();
+    }
+
+    fn submit_create_project(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(session_token) = self.session_token.clone() else {
+            return;
+        };
+        let name = self.new_project_name_editor.read(cx).text(cx).trim().to_string();
+        if name.is_empty() {
+            return;
+        }
+        self.new_project_name_editor
+            .update(cx, |editor, cx| editor.clear(window, cx));
+        self.creating_project = false;
+        self.loading_projects = true;
+        cx.notify();
+
+        cx.spawn(async move |this: WeakEntity<Self>, cx: &mut AsyncApp| {
+            let result = tokio_runtime()
+                .spawn(create_project_request(session_token, name))
+                .await;
+            match result {
+                Ok(Ok(created)) => {
+                    let _ = this.update(cx, |panel, cx| {
+                        panel.switch_to_project(
+                            created.project.id,
+                            created.project.name,
+                            Some((created.actor.id, created.actor.kind, created.actor.display_name, created.actor_token)),
+                            cx,
+                        );
+                    });
+                }
+                Ok(Err(err)) => {
+                    let _ = this.update(cx, |panel, cx| {
+                        panel.loading_projects = false;
+                        panel.projects_error = Some(format!("Create project failed: {err:#}"));
+                        cx.notify();
+                    });
+                }
+                Err(err) => {
+                    let _ = this.update(cx, |panel, cx| {
+                        panel.loading_projects = false;
+                        panel.projects_error = Some(format!("Create project failed: {err:#}"));
+                        cx.notify();
+                    });
+                }
+            }
+        })
+        .detach();
+    }
+
+    /// Tears down the panel's whole live connection for the current project
+    /// and rebuilds it scoped to `new_project_id` — a project switch isn't
+    /// just changing an id, it's a full reconnect. `provisioned_actor`, when
+    /// given (project just created via `submit_create_project`), skips the
+    /// `join_project_request` round-trip since the backend already handed
+    /// back this session's actor for the new project.
+    fn switch_to_project(
+        &mut self,
+        new_project_id: String,
+        new_project_name: String,
+        provisioned_actor: Option<(String, String, String, String)>,
+        cx: &mut Context<Self>,
+    ) {
+        // Cancels the running websocket connect/reconnect loop for the old
+        // project (dropping a GPUI Task cancels it).
+        self._ws_task = None;
+
+        self.feed_events.clear();
+        self.presence.clear();
+        self.actors.clear();
+        self.connection_status = ConnectionStatus::Connecting;
+        self.brief = None;
+        self.expanded_job_id = None;
+        self.expanded_transcript_job_id = None;
+        self.job_turns.clear();
+        self.pending_duplicate = None;
+        self.search_results.clear();
+        self.search_error = None;
+        self.actor_id = None;
+        self.actor_token = None;
+        self.connected_agent_config = None;
+        self.action_status = Some(format!("Switched to {new_project_name}"));
+
+        self.project_id = Some(new_project_id.clone());
+
+        if let Some((actor_id, actor_kind, actor_display_name, actor_token)) = provisioned_actor {
+            self.actor_id = Some(actor_id.clone());
+            self.actor_token = Some(actor_token);
+            self.actors.push(ActorInfo {
+                id: actor_id,
+                kind: actor_kind,
+                display_name: actor_display_name,
+            });
+            RallyLiveState::global(cx).update(cx, |state, cx| {
+                state.set_actor_identity(self.actor_id.clone(), self.actor_token.clone(), cx)
+            });
+            self.loading_projects = false;
+            self.start_background_sync(cx);
+            cx.notify();
+        } else if let Some(session_token) = self.session_token.clone() {
+            cx.spawn(async move |this: WeakEntity<Self>, cx: &mut AsyncApp| {
+                let join_result = tokio_runtime()
+                    .spawn(join_project_request(new_project_id, session_token))
+                    .await;
+                let _ = this.update(cx, |panel, cx| {
+                    match join_result {
+                        Ok(Ok(response)) => {
+                            panel.actor_id = Some(response.actor.id.clone());
+                            panel.actor_token = Some(response.actor_token.clone());
+                            RallyLiveState::global(cx).update(cx, |state, cx| {
+                                state.set_actor_identity(
+                                    panel.actor_id.clone(),
+                                    panel.actor_token.clone(),
+                                    cx,
+                                )
+                            });
+                            if !panel.actors.iter().any(|a| a.id == response.actor.id) {
+                                panel.actors.push(ActorInfo {
+                                    id: response.actor.id,
+                                    kind: response.actor.kind,
+                                    display_name: response.actor.display_name,
+                                });
+                            }
+                        }
+                        Ok(Err(err)) => {
+                            panel.action_status = Some(format!("Switched project, but couldn't join it: {err:#}"));
+                        }
+                        Err(err) => {
+                            panel.action_status = Some(format!("Switched project, but couldn't join it: {err:#}"));
+                        }
+                    }
+                    panel.start_background_sync(cx);
+                    cx.notify();
+                });
+            })
+            .detach();
+            self.loading_projects = false;
+            cx.notify();
+        } else {
+            self.loading_projects = false;
+            self.start_background_sync(cx);
+            cx.notify();
+        }
+    }
+
     fn render_tab_strip(&mut self, cx: &mut Context<Self>) -> gpui::AnyElement {
-        let tabs: [(PanelView, &'static str); 5] = [
+        let tabs: [(PanelView, &'static str); 6] = [
             (PanelView::Feed, "Feed"),
             (PanelView::Tasks, "Tasks"),
             (PanelView::Investigations, "Investigations"),
             (PanelView::Decisions, "Decisions"),
             (PanelView::AgentJobs, "Agent Jobs"),
+            (PanelView::Projects, "Projects"),
         ];
         h_flex()
             .gap_1()
@@ -1634,6 +1874,12 @@ impl ProjectBrainPanel {
     }
 
     fn render_active_view(&mut self, cx: &mut Context<Self>) -> gpui::AnyElement {
+        // Projects doesn't depend on `brief` (shared project memory) — it's
+        // the view you use *before* a project is even selected, so it can't
+        // gate on the same "brief loaded" check every other tab does.
+        if self.active_view == PanelView::Projects {
+            return self.render_projects_view(cx);
+        }
         let Some(brief) = self.brief.clone() else {
             return Label::new("Loading shared memory…")
                 .size(LabelSize::Small)
@@ -1646,7 +1892,139 @@ impl ProjectBrainPanel {
             PanelView::Investigations => self.render_investigations_view(&brief, cx),
             PanelView::Decisions => self.render_decisions_view(cx),
             PanelView::AgentJobs => self.render_agent_jobs_view(&brief, cx),
+            PanelView::Projects => unreachable!(),
         }
+    }
+
+    fn render_projects_view(&mut self, cx: &mut Context<Self>) -> gpui::AnyElement {
+        let Some(session_token) = self.session_token.clone() else {
+            return Label::new(
+                "Log in above to see and switch between your projects.",
+            )
+            .size(LabelSize::Small)
+            .color(Color::Muted)
+            .into_any_element();
+        };
+        let _ = session_token;
+
+        let mut root = v_flex().gap_2();
+
+        if self.loading_projects {
+            root = root.child(
+                Label::new("Loading projects…")
+                    .size(LabelSize::Small)
+                    .color(Color::Muted),
+            );
+        }
+
+        if let Some(error) = self.projects_error.clone() {
+            root = root.child(
+                Label::new(error)
+                    .size(LabelSize::XSmall)
+                    .color(Color::Error),
+            );
+        }
+
+        if !self.loading_projects && self.my_projects.is_empty() && self.projects_error.is_none() {
+            root = root.child(
+                Label::new("No projects yet — create one below.")
+                    .size(LabelSize::Small)
+                    .color(Color::Muted),
+            );
+        }
+
+        root = root.child(v_flex().gap_1().children(self.my_projects.clone().into_iter().map(
+            |project| {
+                let is_current = self.project_id.as_deref() == Some(project.id.as_str());
+                let project_id = project.id.clone();
+                let project_name = project.name.clone();
+                h_flex()
+                    .id(SharedString::from(format!("project-row-{}", project.id)))
+                    .w_full()
+                    .justify_between()
+                    .items_center()
+                    .px_2()
+                    .py_1()
+                    .rounded_md()
+                    .when(is_current, |this| {
+                        this.bg(cx.theme().colors().element_selected)
+                    })
+                    .child(
+                        h_flex()
+                            .gap_1p5()
+                            .items_center()
+                            .child(Label::new(project.name.clone()).size(LabelSize::Small))
+                            .when(is_current, |this| {
+                                this.child(
+                                    Label::new("current")
+                                        .size(LabelSize::XSmall)
+                                        .color(Color::Accent),
+                                )
+                            }),
+                    )
+                    .when(!is_current, |this| {
+                        this.child(
+                            Button::new(
+                                SharedString::from(format!("switch-project-{project_id}")),
+                                "Switch",
+                            )
+                            .label_size(LabelSize::Small)
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                this.switch_to_project(
+                                    project_id.clone(),
+                                    project_name.clone(),
+                                    None,
+                                    cx,
+                                );
+                            })),
+                        )
+                    })
+                    .into_any_element()
+            },
+        )));
+
+        root = root.child(
+            v_flex()
+                .gap_1p5()
+                .p_2()
+                .rounded_md()
+                .bg(cx.theme().colors().element_background)
+                .child(
+                    Label::new("NEW PROJECT")
+                        .size(LabelSize::XSmall)
+                        .color(Color::Muted),
+                )
+                .children(if self.creating_project {
+                    vec![
+                        div()
+                            .rounded_md()
+                            .border_1()
+                            .border_color(cx.theme().colors().border)
+                            .px_2()
+                            .py_1()
+                            .child(self.new_project_name_editor.clone())
+                            .into_any_element(),
+                        Button::new("submit-create-project", "Create")
+                            .label_size(LabelSize::Small)
+                            .color(Color::Accent)
+                            .on_click(cx.listener(|this, _, window, cx| {
+                                this.submit_create_project(window, cx);
+                            }))
+                            .into_any_element(),
+                    ]
+                } else {
+                    vec![
+                        Button::new("toggle-create-project", "+ New Project")
+                            .label_size(LabelSize::Small)
+                            .on_click(cx.listener(|this, _, window, cx| {
+                                this.toggle_create_project_form(window, cx);
+                            }))
+                            .into_any_element(),
+                    ]
+                }),
+        );
+
+        root.into_any_element()
     }
 
     fn render_feed_view(&mut self, cx: &mut Context<Self>) -> gpui::AnyElement {
@@ -2619,14 +2997,17 @@ async fn create_actor_request(
     project_id: String,
     display_name: String,
     kind: String,
+    session_token: Option<String>,
 ) -> anyhow::Result<CreateActorResponse> {
     let url = format!("{}/projects/{}/actors", backend_base_url(), project_id);
     let client = reqwest::Client::new();
-    let res = client
+    let mut req = client
         .post(&url)
-        .json(&serde_json::json!({ "kind": kind, "display_name": display_name }))
-        .send()
-        .await?;
+        .json(&serde_json::json!({ "kind": kind, "display_name": display_name }));
+    if let Some(token) = session_token {
+        req = req.bearer_auth(token);
+    }
+    let res = req.send().await?;
     if !res.status().is_success() {
         let status = res.status();
         let text = res.text().await.unwrap_or_default();
@@ -2714,6 +3095,48 @@ async fn join_project_request(
         anyhow::bail!("{status}: {text}");
     }
     Ok(res.json::<JoinProjectResponse>().await?)
+}
+
+async fn list_my_projects_request(session_token: String) -> anyhow::Result<Vec<ProjectSummary>> {
+    let url = format!("{}/users/me/projects", backend_base_url());
+    let client = reqwest::Client::new();
+    let res = client.get(&url).bearer_auth(session_token).send().await?;
+    if !res.status().is_success() {
+        let status = res.status();
+        let text = res.text().await.unwrap_or_default();
+        anyhow::bail!("{status}: {text}");
+    }
+    Ok(res.json::<Vec<ProjectSummary>>().await?)
+}
+
+/// Mirrors the backend's `CreateMyProjectResponse` (`POST
+/// /users/me/projects`) — same shape `join_project_request` already
+/// partially mirrors via `JoinProjectResponse`, plus the created project.
+#[derive(Debug, Deserialize)]
+struct CreateProjectResult {
+    project: ProjectSummary,
+    actor: SessionActor,
+    actor_token: String,
+}
+
+async fn create_project_request(
+    session_token: String,
+    name: String,
+) -> anyhow::Result<CreateProjectResult> {
+    let url = format!("{}/users/me/projects", backend_base_url());
+    let client = reqwest::Client::new();
+    let res = client
+        .post(&url)
+        .bearer_auth(session_token)
+        .json(&serde_json::json!({ "name": name }))
+        .send()
+        .await?;
+    if !res.status().is_success() {
+        let status = res.status();
+        let text = res.text().await.unwrap_or_default();
+        anyhow::bail!("{status}: {text}");
+    }
+    Ok(res.json::<CreateProjectResult>().await?)
 }
 
 async fn post_json(url: String, body: serde_json::Value, token: Option<String>) -> anyhow::Result<()> {
