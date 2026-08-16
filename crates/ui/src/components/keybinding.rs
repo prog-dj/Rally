@@ -219,7 +219,11 @@ impl RenderOnce for KeyBinding {
                     h_flex()
                         .flex_none()
                         .py_0p5()
-                        .rounded_xs()
+                        .px_1()
+                        .rounded_sm()
+                        .bg(cx.theme().colors().element_background)
+                        .border_1()
+                        .border_color(cx.theme().colors().border_variant)
                         .text_color(cx.theme().colors().text_muted)
                         .children(render_keybinding_keystroke(
                             keystroke,

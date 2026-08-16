@@ -142,9 +142,21 @@ impl RenderOnce for Tab {
         };
 
         self.div
+            .relative()
             .h(Tab::container_height(cx))
             .bg(tab_bg)
             .border_color(cx.theme().colors().border)
+            .when(self.selected, |this| {
+                this.child(
+                    div()
+                        .absolute()
+                        .top_0()
+                        .left_0()
+                        .w_full()
+                        .h(px(2.))
+                        .bg(cx.theme().colors().text_accent),
+                )
+            })
             .map(|this| match self.position {
                 TabPosition::First => {
                     if self.selected {

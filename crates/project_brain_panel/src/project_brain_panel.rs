@@ -537,6 +537,7 @@ impl ProjectBrainPanel {
 
     fn start_background_sync(&mut self, cx: &mut Context<Self>) {
         let project_id = self.project_id.clone();
+        let session_token = self.session_token.clone();
         let task = cx.spawn(async move |this: WeakEntity<Self>, cx: &mut AsyncApp| {
             // 1. Fetch initial feed history (run on the Tokio runtime, since
             //    reqwest needs a real Tokio reactor for DNS/networking).
@@ -581,7 +582,7 @@ impl ProjectBrainPanel {
             // 1c. Fetch the actor roster, so ids elsewhere can be shown as
             //     names.
             let actors_result = tokio_runtime()
-                .spawn(fetch_actors(project_id.clone()))
+                .spawn(fetch_actors(project_id.clone(), session_token.clone()))
                 .await;
             if let Ok(Ok(actors)) = actors_result {
                 let _ = this.update(cx, |panel, cx| {
@@ -2977,10 +2978,25 @@ async fn fetch_project_context(project_id: String) -> anyhow::Result<ProjectCont
     Ok(context)
 }
 
-async fn fetch_actors(project_id: String) -> anyhow::Result<Vec<ActorInfo>> {
+/// Requires session auth + project membership as of this session's backend
+/// changes — `session_token` must be the logged-in user's, not an actor
+/// bearer token (this endpoint would reject that as an invalid session).
+async fn fetch_actors(
+    project_id: String,
+    session_token: Option<String>,
+) -> anyhow::Result<Vec<ActorInfo>> {
     let url = format!("{}/projects/{}/actors", backend_base_url(), project_id);
     let client = reqwest::Client::new();
-    let res = client.get(&url).send().await?;
+    let mut req = client.get(&url);
+    if let Some(token) = session_token {
+        req = req.bearer_auth(token);
+    }
+    let res = req.send().await?;
+    if !res.status().is_success() {
+        let status = res.status();
+        let text = res.text().await.unwrap_or_default();
+        anyhow::bail!("{status}: {text}");
+    }
     let actors = res.json::<Vec<ActorInfo>>().await?;
     Ok(actors)
 }

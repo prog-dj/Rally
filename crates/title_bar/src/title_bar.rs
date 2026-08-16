@@ -417,6 +417,8 @@ impl Render for TitleBar {
                         .pl_2()
                         .justify_between()
                         .w_full()
+                        .border_b_1()
+                        .border_color(cx.theme().colors().border)
                         .children(children),
                 )
                 .into_any_element()
