@@ -89,3 +89,63 @@ pub fn register_rally_context_server(
             .insert(Arc::from(RALLY_CONTEXT_SERVER_ID), entry);
     });
 }
+
+/// Same marker/snippet the CLI (`mcp-server login --agent`) writes — kept
+/// byte-identical on purpose so a project onboarded from either path ends
+/// up with the same files. Text is duplicated (Rust here, JS there) since
+/// there's no shared source between the two; if you edit one, edit both.
+const RALLY_MARKER: &str = "<!-- rally-project-brain:onboarding -->";
+const INSTRUCTION_FILE_NAMES: &[&str] =
+    &["CLAUDE.md", "AGENTS.md", "GEMINI.md", ".cursorrules", ".windsurfrules"];
+
+fn rally_onboarding_snippet() -> String {
+    format!(
+        "{RALLY_MARKER}\n\
+         This project is connected to Rally Project Brain. At the start of every \
+         session, before anything else, call `get_project_context` to see what's \
+         already been done — other agents and humans share this project's memory. \
+         Starting a new task? Call `create_agent_job` first with the human's \
+         actual request as `goal`, then `report_activity` as you work.\n\
+         <!-- /rally-project-brain:onboarding -->"
+    )
+}
+
+/// Writes (or appends to, if one already exists and lacks the marker) the
+/// same onboarding note to every known instructions-file convention in
+/// `worktree_root`. Connecting an agent via this panel wires its MCP
+/// *tools* automatically (`register_rally_context_server` above) — it
+/// doesn't give the agent the *habit* of using them proactively, the same
+/// gap the CLI login flow closes for externally-connected agents. An agent
+/// launched inside Zed via "Launch in Zed now" needs the same nudge, since
+/// nothing else tells it to check Rally before acting on the human's first
+/// message. Best-effort: a write failure for one file is logged and
+/// skipped, never fails the connection itself.
+pub async fn write_onboarding_instructions(fs: Arc<dyn Fs>, worktree_root: PathBuf) {
+    let snippet = rally_onboarding_snippet();
+    for name in INSTRUCTION_FILE_NAMES {
+        let path = worktree_root.join(name);
+        let existing = if fs.is_file(&path).await {
+            match fs.load(&path).await {
+                Ok(content) => Some(content),
+                Err(err) => {
+                    log::warn!("couldn't read {} to add Rally onboarding note: {err:#}", path.display());
+                    continue;
+                }
+            }
+        } else {
+            None
+        };
+
+        let new_content = match existing {
+            None => format!("{snippet}\n"),
+            Some(content) if !content.contains(RALLY_MARKER) => {
+                format!("{}\n\n{snippet}\n", content.trim_end())
+            }
+            Some(_) => continue, // marker already present, don't duplicate
+        };
+
+        if let Err(err) = fs.atomic_write(path.clone(), new_content).await {
+            log::warn!("couldn't write Rally onboarding note to {}: {err:#}", path.display());
+        }
+    }
+}

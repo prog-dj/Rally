@@ -1513,7 +1513,7 @@ impl ProjectBrainPanel {
                     session_token,
                 ))
                 .await;
-            let _ = this.update(cx, |panel, cx| {
+            let onboarding_target = this.update(cx, |panel, cx| {
                 match result {
                     Ok(Ok(response)) => {
                         // Mosaic-style onboarding: hand over a token + one
@@ -1551,16 +1551,33 @@ impl ProjectBrainPanel {
                         panel.action_status = Some(
                             "Agent connected — token copied to clipboard, shown only once".into(),
                         );
+                        cx.notify();
+                        let root = panel
+                            .workspace
+                            .upgrade()
+                            .and_then(|ws| ws.read(cx).project().read(cx).visible_worktrees(cx).next())
+                            .map(|wt| wt.read(cx).abs_path().to_path_buf());
+                        root.map(|root| (<dyn fs::Fs>::global(cx), root))
                     }
                     Ok(Err(err)) => {
                         panel.action_status = Some(format!("Connect agent failed: {err:#}"));
+                        cx.notify();
+                        None
                     }
                     Err(err) => {
                         panel.action_status = Some(format!("Connect agent failed: {err:#}"));
+                        cx.notify();
+                        None
                     }
                 }
-                cx.notify();
             });
+            // Best-effort — nudges an in-Zed-launched agent to check Rally
+            // proactively, the same gap the CLI login flow closes for
+            // agents connecting from outside Zed. Never blocks the panel;
+            // failures are logged inside write_onboarding_instructions.
+            if let Ok(Some((fs, root))) = onboarding_target {
+                crate::mcp_bridge::write_onboarding_instructions(fs, root).await;
+            }
         })
         .detach();
     }
