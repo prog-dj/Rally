@@ -16,7 +16,7 @@ doctest = false
 agent_servers.workspace = true
 agent_ui.workspace = true
 anyhow.workspace = true
-async-tungstenite = { workspace = true, features = ["tokio", "tokio-rustls-native-certs"] }
+async-tungstenite = { workspace = true, features = ["tokio", "tokio-rustls-manual-roots"] }
 chrono.workspace = true
 collections.workspace = true
 db.workspace = true
@@ -24,6 +24,7 @@ editor.workspace = true
 fs.workspace = true
 futures.workspace = true
 gpui.workspace = true
+http_client_tls.workspace = true
 log.workspace = true
 menu.workspace = true
 project.workspace = true
@@ -37,3 +38,4 @@ ui.workspace = true
 util.workspace = true
 workspace.workspace = true
 tokio = { version = "1", features = ["rt-multi-thread", "time"] }
+tokio-rustls = { version = "0.26", features = ["tls12", "ring"], default-features = false }

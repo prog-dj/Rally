@@ -136,6 +136,17 @@ pub struct ActorInfo {
     pub display_name: String,
 }
 
+/// What the "Connect Agent" flow shows once, right after a new agent actor
+/// is created — the Mosaic-style token + fixed CLI command pattern, not a
+/// raw config blob the human has to hand-edit.
+#[derive(Clone, Debug)]
+pub struct ConnectedAgentInfo {
+    pub display_name: String,
+    pub token: String,
+    pub expires_at: Option<DateTime<Utc>>,
+    pub command: String,
+}
+
 /// The wire shape of `POST /projects/:id/actors` — the actor row flattened
 /// together with its one-time bearer token.
 #[derive(Clone, Debug, Deserialize)]
@@ -145,6 +156,8 @@ pub struct CreateActorResponse {
     pub kind: String,
     pub display_name: String,
     pub token: String,
+    #[serde(default)]
+    pub token_expires_at: Option<DateTime<Utc>>,
 }
 
 /// A lightweight mirror of the backend's full AgentJob, as broadcast on
@@ -393,7 +406,7 @@ pub struct ProjectBrainPanel {
     /// The env-var block to hand to whatever will act as the agent, once
     /// created. Shown once, same as a token — the backend never returns it
     /// again after this.
-    connected_agent_config: Option<String>,
+    connected_agent: Option<ConnectedAgentInfo>,
     _ws_task: Option<Task<()>>,
     /// The project this session is currently scoped to — seeded from
     /// `RALLY_PROJECT_ID` at construction, then mutable via the Projects
@@ -528,7 +541,7 @@ impl ProjectBrainPanel {
             login_error: None,
             connecting_agent: false,
             new_agent_name_editor,
-            connected_agent_config: None,
+            connected_agent: None,
             _ws_task: None,
             project_id: get_project_id(),
             my_projects: Vec::new(),
@@ -612,9 +625,28 @@ impl ProjectBrainPanel {
                     cx.notify();
                 });
 
+                // async-tungstenite's own auto-load-on-None-connector path
+                // requires an explicit connector regardless of which
+                // "tokio-rustls-*" feature is selected here, once features
+                // unify with the rest of the workspace (client/collab/repl
+                // all select tokio-rustls-manual-roots) — so build one
+                // explicitly, the same way client's proxy.rs does, rather
+                // than relying on the crate to load roots for us.
                 let ws_url_clone = ws_url.clone();
                 let connect_result = tokio_runtime()
-                    .spawn(async move { async_tungstenite::tokio::connect_async(&ws_url_clone).await })
+                    .spawn(async move {
+                        // async-tungstenite's `Connector` is a type alias
+                        // for `tokio_rustls::TlsConnector` under the
+                        // rustls-backed features — no enum variant to wrap.
+                        let connector = tokio_rustls::TlsConnector::from(std::sync::Arc::new(
+                            http_client_tls::tls_config(),
+                        ));
+                        async_tungstenite::tokio::connect_async_with_tls_connector(
+                            &ws_url_clone,
+                            Some(connector),
+                        )
+                        .await
+                    })
                     .await;
 
                 match connect_result {
@@ -1484,13 +1516,17 @@ impl ProjectBrainPanel {
             let _ = this.update(cx, |panel, cx| {
                 match result {
                     Ok(Ok(response)) => {
-                        let config = format!(
-                            "RALLY_BACKEND_URL={}\nRALLY_PROJECT_ID={}\nRALLY_ACTOR_ID={}\nRALLY_ACTOR_TOKEN={}",
-                            backend_base_url(),
-                            project_id,
-                            response.id,
-                            response.token,
-                        );
+                        // Mosaic-style onboarding: hand over a token + one
+                        // fixed CLI command, not a raw config blob the human
+                        // has to know where to save. `login --agent` (added
+                        // to the existing mcp-server bin) resolves the rest
+                        // itself via /actors/whoami and writes .mcp.json.
+                        let mcp_server_path = crate::mcp_bridge::mcp_server_path_display()
+                            .unwrap_or_else(|| {
+                                "<path to Rally_Backend/mcp-server/index.mjs on the agent's machine>"
+                                    .to_string()
+                            });
+                        let command = format!("node \"{mcp_server_path}\" login --agent");
                         crate::mcp_bridge::register_rally_context_server(
                             cx,
                             backend_base_url(),
@@ -1498,16 +1534,22 @@ impl ProjectBrainPanel {
                             response.id.clone(),
                             response.token.clone(),
                         );
+                        let agent_info = ConnectedAgentInfo {
+                            display_name: response.display_name.clone(),
+                            token: response.token.clone(),
+                            expires_at: response.token_expires_at,
+                            command,
+                        };
                         panel.actors.push(ActorInfo {
                             id: response.id,
                             kind: response.kind,
                             display_name: response.display_name,
                         });
-                        cx.write_to_clipboard(ClipboardItem::new_string(config.clone()));
-                        panel.connected_agent_config = Some(config);
+                        cx.write_to_clipboard(ClipboardItem::new_string(agent_info.token.clone()));
+                        panel.connected_agent = Some(agent_info);
                         panel.connecting_agent = false;
                         panel.action_status = Some(
-                            "Agent connected — config copied to clipboard, shown only once".into(),
+                            "Agent connected — token copied to clipboard, shown only once".into(),
                         );
                     }
                     Ok(Err(err)) => {
@@ -1738,7 +1780,7 @@ impl ProjectBrainPanel {
         self.search_error = None;
         self.actor_id = None;
         self.actor_token = None;
-        self.connected_agent_config = None;
+        self.connected_agent = None;
         self.action_status = Some(format!("Switched to {new_project_name}"));
 
         self.project_id = Some(new_project_id.clone());
@@ -2781,34 +2823,122 @@ impl ProjectBrainPanel {
                 );
             }
 
-            if let Some(config) = self.connected_agent_config.clone() {
+            if let Some(agent) = self.connected_agent.clone() {
+                let expiry_label = agent
+                    .expires_at
+                    .map(|e| format!("expires {}", e.format("%b %-d, %Y, %-I:%M %p UTC")))
+                    .unwrap_or_else(|| "no expiry".to_string());
                 root = root.child(
                     v_flex()
-                        .gap_1()
+                        .gap_1p5()
                         .p_2()
                         .rounded_md()
                         .bg(cx.theme().colors().editor_background)
                         .child(
-                            Label::new("Give this to the agent — shown once")
+                            Label::new(format!("@{}", agent.display_name))
+                                .size(LabelSize::Small)
+                                .weight(gpui::FontWeight::SEMIBOLD),
+                        )
+                        .child(
+                            Label::new(format!("Token shown only once · {expiry_label}"))
                                 .size(LabelSize::XSmall)
                                 .color(Color::Warning),
                         )
                         .child(
-                            div()
-                                .rounded_md()
-                                .bg(cx.theme().colors().editor_background)
-                                .p_1()
-                                .child(Label::new(config).size(LabelSize::XSmall).color(Color::Muted)),
+                            Label::new("Token").size(LabelSize::XSmall).color(Color::Muted),
                         )
                         .child(
-                            Button::new("copy-agent-config", "Copy Config")
+                            h_flex()
+                                .gap_1()
+                                .child(
+                                    div()
+                                        .flex_1()
+                                        .rounded_md()
+                                        .border_1()
+                                        .border_color(cx.theme().colors().border)
+                                        .px_2()
+                                        .py_1()
+                                        .child(
+                                            Label::new(agent.token.clone())
+                                                .size(LabelSize::XSmall)
+                                                .color(Color::Muted),
+                                        ),
+                                )
+                                .child(
+                                    Button::new("copy-agent-token", "Copy")
+                                        .label_size(LabelSize::Small)
+                                        .on_click(cx.listener(|this, _, _, cx| {
+                                            if let Some(agent) = this.connected_agent.clone() {
+                                                cx.write_to_clipboard(ClipboardItem::new_string(
+                                                    agent.token,
+                                                ));
+                                                this.action_status =
+                                                    Some("Token copied to clipboard".into());
+                                                cx.notify();
+                                            }
+                                        })),
+                                ),
+                        )
+                        .child(
+                            Label::new("Command").size(LabelSize::XSmall).color(Color::Muted),
+                        )
+                        .child(
+                            h_flex()
+                                .gap_1()
+                                .child(
+                                    div()
+                                        .flex_1()
+                                        .rounded_md()
+                                        .border_1()
+                                        .border_color(cx.theme().colors().border)
+                                        .px_2()
+                                        .py_1()
+                                        .child(
+                                            Label::new(agent.command.clone())
+                                                .size(LabelSize::XSmall)
+                                                .color(Color::Muted),
+                                        ),
+                                )
+                                .child(
+                                    Button::new("copy-agent-command", "Copy")
+                                        .label_size(LabelSize::Small)
+                                        .on_click(cx.listener(|this, _, _, cx| {
+                                            if let Some(agent) = this.connected_agent.clone() {
+                                                cx.write_to_clipboard(ClipboardItem::new_string(
+                                                    agent.command,
+                                                ));
+                                                this.action_status =
+                                                    Some("Command copied to clipboard".into());
+                                                cx.notify();
+                                            }
+                                        })),
+                                ),
+                        )
+                        .child(
+                            Label::new(
+                                "Run that command in the agent's project directory, then paste \
+                                 the token when it prompts for it — it writes .mcp.json itself.",
+                            )
+                            .size(LabelSize::XSmall)
+                            .color(Color::Muted),
+                        )
+                        .children(
+                            crate::mcp_bridge::mcp_server_path_display().is_none().then(|| {
+                                Label::new(
+                                    "Note: RALLY_MCP_SERVER_PATH isn't set on this machine, so \
+                                     the command above has a placeholder instead of a real path \
+                                     to mcp-server/index.mjs — edit that before running it.",
+                                )
+                                .size(LabelSize::XSmall)
+                                .color(Color::Warning)
+                            }),
+                        )
+                        .child(
+                            Button::new("connected-agent-done", "Done")
                                 .label_size(LabelSize::Small)
                                 .on_click(cx.listener(|this, _, _, cx| {
-                                    if let Some(config) = this.connected_agent_config.clone() {
-                                        cx.write_to_clipboard(ClipboardItem::new_string(config));
-                                        this.action_status = Some("Config copied to clipboard".into());
-                                        cx.notify();
-                                    }
+                                    this.connected_agent = None;
+                                    cx.notify();
                                 })),
                         )
                         .children({

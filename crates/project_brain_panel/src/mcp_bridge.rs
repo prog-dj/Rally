@@ -37,6 +37,15 @@ fn mcp_server_path() -> Option<PathBuf> {
     std::env::var("RALLY_MCP_SERVER_PATH").ok().map(PathBuf::from)
 }
 
+/// Exposed so the "Connect Agent" flow can build a real, usable `.mcp.json`
+/// snippet for external agents (a separate Claude Code/Cursor/etc. session,
+/// not one launched inside this Zed instance) — those need the actual path
+/// on disk to `mcp-server/index.mjs`, same as this module's own in-Zed
+/// auto-wiring does.
+pub fn mcp_server_path_display() -> Option<String> {
+    mcp_server_path().map(|p| p.display().to_string())
+}
+
 /// Upserts the `"rally"` context server entry in the user's Zed settings
 /// with this actor's credentials. No-ops (with a log warning) if
 /// `RALLY_MCP_SERVER_PATH` isn't set, since there is nothing to point the
