@@ -40,8 +40,13 @@ function Get-VSArch {
     }
 }
 
+$vswhere = "C:\Program Files (x86)\Microsoft Visual Studio\Installer\vswhere.exe"
+$vsInstallPath = & $vswhere -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath
+if (-not $vsInstallPath) {
+    throw "No Visual Studio installation with the C++ build tools found (checked via vswhere)."
+}
 Push-Location
-& "C:\Program Files\Microsoft Visual Studio\2022\Community\Common7\Tools\Launch-VsDevShell.ps1" -Arch (Get-VSArch -Arch $Architecture) -HostArch (Get-VSArch -Arch $OSArchitecture)
+& "$vsInstallPath\Common7\Tools\Launch-VsDevShell.ps1" -Arch (Get-VSArch -Arch $Architecture) -HostArch (Get-VSArch -Arch $OSArchitecture)
 Pop-Location
 
 $target = "$Architecture-pc-windows-msvc"
@@ -308,15 +313,23 @@ function BuildInstaller {
         "dev" {
             $appId = "{{8357632E-24A4-4F32-BA97-E575B4D1FE5D}"
             $appIconName = "app-icon-dev"
-            $appName = "Zed Dev"
-            $appDisplayName = "Zed Dev"
-            $appSetupName = "Zed-$Architecture"
+            # User-facing installer/shell branding only (Start Menu name,
+            # install dir, wizard title, Add/Remove Programs entry). Does NOT
+            # rename the app itself — the running binary's window title,
+            # taskbar identity, and internal instance-mutex/AppUserModelID
+            # strings are unchanged (still "Zed"/"Zed-*"), since those are
+            # compiled into the app across many files, not installer config.
+            # Left as-is on purpose: $appExeName, $appMutex (must match
+            # windows_only_instance.rs), $appUserId, $appAppxFullName.
+            $appName = "Rally IDE"
+            $appDisplayName = "Rally IDE"
+            $appSetupName = "Rally_IDE-$Architecture"
             # The mutex name here should match the mutex name in crates\zed\src\zed\windows_only_instance.rs
             $appMutex = "Zed-Dev-Instance-Mutex"
             $appExeName = "Zed"
-            $regValueName = "ZedDev"
+            $regValueName = "RallyIDEDev"
             $appUserId = "ZedIndustries.Zed.Dev"
-            $appShellNameShort = "Z&ed Dev"
+            $appShellNameShort = "&Rally IDE"
             $appAppxFullName = "ZedIndustries.Zed.Dev_1.0.0.0_neutral__japxn1gcva8rg"
         }
         default {
@@ -328,7 +341,18 @@ function BuildInstaller {
     # Windows runner 2022 default has iscc in PATH, https://github.com/actions/runner-images/blob/main/images/windows/Windows2022-Readme.md
     # Currently, we are using Windows 2022 runner.
     # Windows runner 2025 doesn't have iscc in PATH for now, https://github.com/actions/runner-images/issues/11228
-    $innoSetupPath = "C:\Program Files (x86)\Inno Setup 6\ISCC.exe"
+    $innoSetupCandidates = @(
+        "C:\Program Files (x86)\Inno Setup 6\ISCC.exe",
+        "$env:LOCALAPPDATA\Programs\Inno Setup 6\ISCC.exe"
+    )
+    $innoSetupPath = $innoSetupCandidates | Where-Object { Test-Path $_ } | Select-Object -First 1
+    if (-not $innoSetupPath) {
+        $isccOnPath = Get-Command "iscc.exe" -ErrorAction SilentlyContinue
+        if ($isccOnPath) { $innoSetupPath = $isccOnPath.Source }
+    }
+    if (-not $innoSetupPath) {
+        throw "Inno Setup's ISCC.exe not found (checked Program Files, LocalAppData\Programs, and PATH)."
+    }
 
     $definitions = @{
         "AppId"          = $appId

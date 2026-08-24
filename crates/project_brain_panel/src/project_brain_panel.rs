@@ -25,13 +25,23 @@ use workspace::{
     dock::{DockPosition, Panel, PanelEvent},
 };
 
-const DEFAULT_BACKEND_BASE_URL: &str = "http://localhost:8080";
+/// Debug builds default to localhost so local development needs no
+/// configuration; release builds (what testers actually run) default to the
+/// deployed backend, mirroring how `release_channel::RELEASE_CHANNEL_NAME`
+/// treats `cfg!(debug_assertions)`. Either can still be overridden with
+/// `RALLY_BACKEND_URL`.
+fn default_backend_base_url() -> &'static str {
+    if cfg!(debug_assertions) {
+        "http://localhost:8080"
+    } else {
+        "https://rally-backend.fly.dev"
+    }
+}
 
 /// Backend base URL — override with `RALLY_BACKEND_URL` (e.g. to point at a
-/// remote Project Brain instance, or a non-default port). Falls back to
-/// localhost so local development needs no configuration.
+/// remote Project Brain instance, or a non-default port).
 fn backend_base_url() -> String {
-    std::env::var("RALLY_BACKEND_URL").unwrap_or_else(|_| DEFAULT_BACKEND_BASE_URL.to_string())
+    std::env::var("RALLY_BACKEND_URL").unwrap_or_else(|_| default_backend_base_url().to_string())
 }
 
 /// Websocket URL for the live feed. Override directly with

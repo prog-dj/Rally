@@ -16,7 +16,7 @@ doctest = false
 agent_servers.workspace = true
 agent_ui.workspace = true
 anyhow.workspace = true
-async-tungstenite = { workspace = true, features = ["tokio", "tokio-rustls-manual-roots"] }
+async-tungstenite = { workspace = true, features = ["tokio", "tokio-rustls-native-certs"] }
 chrono.workspace = true
 collections.workspace = true
 db.workspace = true

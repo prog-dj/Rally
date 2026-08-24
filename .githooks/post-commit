@@ -1,0 +1,5 @@
+#!/bin/sh
+# Agent-agnostic commit reporter — see post-commit-report.mjs for details.
+# Requires `git config core.hooksPath .githooks` (once per clone).
+node "$(git rev-parse --show-toplevel)/.githooks/post-commit-report.mjs"
+exit 0

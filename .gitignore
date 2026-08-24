@@ -11,6 +11,7 @@
 .blob_store
 .build
 .claude/settings.local.json
+.mcp.json
 .envrc
 .flatpak-builder
 .idea
@@ -46,6 +47,15 @@ crates/docs_preprocessor/actions.json
 
 # `nix build` output
 /result
+
+# Windows installer build scratch (script/bundle-windows.ps1) — downloaded
+# SDKs and the Inno Setup staging tree, not source.
+/AGS_SDK-*/
+/AGS_SDK_*.zip
+/Microsoft.Windows.Console.ConPTY.*.nupkg
+/build/
+/conpty/
+/inno/
 
 # Visual test baseline images (these will be stored outside
 # the repo in the future, but we don't haven't decided exactly

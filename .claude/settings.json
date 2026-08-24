@@ -1,0 +1,17 @@
+{
+  "hooks": {
+    "PostToolUse": [
+      {
+        "matcher": "Edit|Write|NotebookEdit|Bash|PowerShell|Grep|Glob",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "node .claude/hooks/report-activity.mjs",
+            "timeout": 8,
+            "async": true
+          }
+        ]
+      }
+    ]
+  }
+}
