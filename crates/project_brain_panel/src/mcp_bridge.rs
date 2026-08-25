@@ -27,22 +27,16 @@ use settings_content::{ContextServerCommand, ContextServerSettingsContent};
 
 const RALLY_CONTEXT_SERVER_ID: &str = "rally";
 
-/// Path to a local `mcp-server/index.mjs` checkout, for in-Zed ACP wiring
-/// only (`register_rally_context_server` below, which spawns `node`
-/// directly rather than going through `npx`). External agents don't need
-/// this at all — `rally-project-brain-mcp` is published to npm, so the
-/// "Connect Agent" flow's copyable command is just
-/// `npx rally-project-brain-mcp login --agent`, no local checkout or path
-/// required. Only relevant on a machine that has `Rally_Backend` checked
-/// out with `RALLY_MCP_SERVER_PATH` pointed at it.
-fn mcp_server_path() -> Option<PathBuf> {
-    std::env::var("RALLY_MCP_SERVER_PATH").ok().map(PathBuf::from)
-}
-
 /// Upserts the `"rally"` context server entry in the user's Zed settings
-/// with this actor's credentials. No-ops (with a log warning) if
-/// `RALLY_MCP_SERVER_PATH` isn't set, since there is nothing to point the
-/// entry at.
+/// with this actor's credentials, referencing it as `npx
+/// rally-project-brain-mcp` — the package is published to npm, so this
+/// needs no local `Rally_Backend` checkout or `RALLY_MCP_SERVER_PATH` env
+/// var (an earlier version of this function required both, and silently
+/// no-op'd with only a log warning if the env var wasn't set — a real
+/// dead-end for anyone without a local backend checkout). `npx` resolves
+/// the package fresh each launch, so this stays correct regardless of
+/// local cache state, same reasoning as the external `login --agent` CLI
+/// flow.
 pub fn register_rally_context_server(
     cx: &App,
     backend_url: String,
@@ -50,13 +44,6 @@ pub fn register_rally_context_server(
     actor_id: String,
     actor_token: String,
 ) {
-    let Some(mcp_server_path) = mcp_server_path() else {
-        log::warn!(
-            "RALLY_MCP_SERVER_PATH is not set — skipping MCP context-server registration for the connected agent"
-        );
-        return;
-    };
-
     let mut env = HashMap::default();
     env.insert("RALLY_BACKEND_URL".to_string(), backend_url);
     env.insert("RALLY_PROJECT_ID".to_string(), project_id);
@@ -67,8 +54,8 @@ pub fn register_rally_context_server(
         enabled: true,
         remote: false,
         command: ContextServerCommand {
-            path: PathBuf::from("node"),
-            args: vec![mcp_server_path.display().to_string()],
+            path: PathBuf::from("npx"),
+            args: vec!["-y".to_string(), "rally-project-brain-mcp".to_string()],
             env: Some(env),
             timeout: None,
         },
