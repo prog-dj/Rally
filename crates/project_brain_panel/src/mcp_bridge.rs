@@ -27,23 +27,16 @@ use settings_content::{ContextServerCommand, ContextServerSettingsContent};
 
 const RALLY_CONTEXT_SERVER_ID: &str = "rally";
 
-/// Path to `mcp-server/index.mjs`. Pre-alpha: this only works on a machine
-/// that has the `Rally_Backend` repo checked out and `RALLY_MCP_SERVER_PATH`
-/// pointed at it. Packaging the MCP server as an installable/`npx`-able
-/// artifact (it already declares `bin: rally-project-brain-mcp`) is out of
-/// scope here — that's an alpha-launch distribution concern, not this
-/// feature's.
+/// Path to a local `mcp-server/index.mjs` checkout, for in-Zed ACP wiring
+/// only (`register_rally_context_server` below, which spawns `node`
+/// directly rather than going through `npx`). External agents don't need
+/// this at all — `rally-project-brain-mcp` is published to npm, so the
+/// "Connect Agent" flow's copyable command is just
+/// `npx rally-project-brain-mcp login --agent`, no local checkout or path
+/// required. Only relevant on a machine that has `Rally_Backend` checked
+/// out with `RALLY_MCP_SERVER_PATH` pointed at it.
 fn mcp_server_path() -> Option<PathBuf> {
     std::env::var("RALLY_MCP_SERVER_PATH").ok().map(PathBuf::from)
-}
-
-/// Exposed so the "Connect Agent" flow can build a real, usable `.mcp.json`
-/// snippet for external agents (a separate Claude Code/Cursor/etc. session,
-/// not one launched inside this Zed instance) — those need the actual path
-/// on disk to `mcp-server/index.mjs`, same as this module's own in-Zed
-/// auto-wiring does.
-pub fn mcp_server_path_display() -> Option<String> {
-    mcp_server_path().map(|p| p.display().to_string())
 }
 
 /// Upserts the `"rally"` context server entry in the user's Zed settings

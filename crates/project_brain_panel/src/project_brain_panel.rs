@@ -25,6 +25,15 @@ use workspace::{
     dock::{DockPosition, Panel, PanelEvent},
 };
 
+/// mcp-server is published to npm (rally-project-brain-mcp), so this is a
+/// fixed command shown in the "Connect Agent" flow — no local checkout, no
+/// path to fill in. (It wasn't always: an earlier version required typing
+/// in a local path, which itself replaced an even earlier version that
+/// baked a fake placeholder path directly into this string and got
+/// copy-pasted verbatim by real users. Publishing removed the need for a
+/// path at all, which is strictly better than any fix to that bug.)
+const RALLY_LOGIN_COMMAND: &str = "npx rally-project-brain-mcp login --agent";
+
 /// Debug builds default to localhost so local development needs no
 /// configuration; release builds (what testers actually run) default to the
 /// deployed backend, mirroring how `release_channel::RELEASE_CHANNEL_NAME`
@@ -144,7 +153,9 @@ pub struct ConnectedAgentInfo {
     pub display_name: String,
     pub token: String,
     pub expires_at: Option<DateTime<Utc>>,
-    pub command: String,
+    // No `command` field — mcp-server is published to npm, so the command
+    // is the fixed `npx rally-project-brain-mcp login --agent`, rendered
+    // directly rather than stored per-connection.
 }
 
 /// The wire shape of `POST /projects/:id/actors` — the actor row flattened
@@ -1517,16 +1528,11 @@ impl ProjectBrainPanel {
                 match result {
                     Ok(Ok(response)) => {
                         // Mosaic-style onboarding: hand over a token + one
-                        // fixed CLI command, not a raw config blob the human
-                        // has to know where to save. `login --agent` (added
-                        // to the existing mcp-server bin) resolves the rest
-                        // itself via /actors/whoami and writes .mcp.json.
-                        let mcp_server_path = crate::mcp_bridge::mcp_server_path_display()
-                            .unwrap_or_else(|| {
-                                "<path to Rally_Backend/mcp-server/index.mjs on the agent's machine>"
-                                    .to_string()
-                            });
-                        let command = format!("node \"{mcp_server_path}\" login --agent");
+                        // fixed CLI command (mcp-server is published to npm
+                        // as rally-project-brain-mcp), not a raw config
+                        // blob the human has to know where to save.
+                        // `login --agent` resolves the rest itself via
+                        // /actors/whoami and writes .mcp.json.
                         crate::mcp_bridge::register_rally_context_server(
                             cx,
                             backend_base_url(),
@@ -1538,7 +1544,6 @@ impl ProjectBrainPanel {
                             display_name: response.display_name.clone(),
                             token: response.token.clone(),
                             expires_at: response.token_expires_at,
-                            command,
                         };
                         panel.actors.push(ActorInfo {
                             id: response.id,
@@ -2911,7 +2916,7 @@ impl ProjectBrainPanel {
                                         .px_2()
                                         .py_1()
                                         .child(
-                                            Label::new(agent.command.clone())
+                                            Label::new(RALLY_LOGIN_COMMAND)
                                                 .size(LabelSize::XSmall)
                                                 .color(Color::Muted),
                                         ),
@@ -2920,14 +2925,12 @@ impl ProjectBrainPanel {
                                     Button::new("copy-agent-command", "Copy")
                                         .label_size(LabelSize::Small)
                                         .on_click(cx.listener(|this, _, _, cx| {
-                                            if let Some(agent) = this.connected_agent.clone() {
-                                                cx.write_to_clipboard(ClipboardItem::new_string(
-                                                    agent.command,
-                                                ));
-                                                this.action_status =
-                                                    Some("Command copied to clipboard".into());
-                                                cx.notify();
-                                            }
+                                            cx.write_to_clipboard(ClipboardItem::new_string(
+                                                RALLY_LOGIN_COMMAND.to_string(),
+                                            ));
+                                            this.action_status =
+                                                Some("Command copied to clipboard".into());
+                                            cx.notify();
                                         })),
                                 ),
                         )
@@ -2938,17 +2941,6 @@ impl ProjectBrainPanel {
                             )
                             .size(LabelSize::XSmall)
                             .color(Color::Muted),
-                        )
-                        .children(
-                            crate::mcp_bridge::mcp_server_path_display().is_none().then(|| {
-                                Label::new(
-                                    "Note: RALLY_MCP_SERVER_PATH isn't set on this machine, so \
-                                     the command above has a placeholder instead of a real path \
-                                     to mcp-server/index.mjs — edit that before running it.",
-                                )
-                                .size(LabelSize::XSmall)
-                                .color(Color::Warning)
-                            }),
                         )
                         .child(
                             Button::new("connected-agent-done", "Done")
