@@ -111,6 +111,10 @@ pub struct FeedEvent {
     pub entity_id: Option<String>,
     pub verb: Option<String>,
     pub summary: String,
+    /// The agent job this event happened during, if any — lets the feed
+    /// group events under their job instead of listing everything flat.
+    #[serde(default)]
+    pub agent_job_id: Option<String>,
     pub created_at: Option<DateTime<Utc>>,
 }
 
@@ -180,6 +184,18 @@ pub struct LiveAgentJob {
     pub status: String,
     #[serde(default)]
     pub claimed_by_actor_id: Option<String>,
+    #[serde(default = "default_owner_session_status")]
+    pub owner_session_status: String,
+}
+
+/// Whether `claimed_by_actor_id` can be displaced by a different actor —
+/// mirrors the backend's `AgentJobOwnerStatus` ("active" | "released" |
+/// "closed"). Defaults to "active" if somehow absent (an older backend, or
+/// a malformed payload), which is the conservative choice: better to block
+/// a claim that should have been allowed than to let two actors both think
+/// they own the same job.
+fn default_owner_session_status() -> String {
+    "active".to_string()
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Deserialize)]
@@ -259,6 +275,8 @@ pub struct BriefAgentJob {
     pub actor_id: String,
     #[serde(default)]
     pub claimed_by_actor_id: Option<String>,
+    #[serde(default = "default_owner_session_status")]
+    pub owner_session_status: String,
 }
 
 /// GET /projects/:id/context — the "walk in cold" shared-memory entrypoint.
@@ -324,6 +342,32 @@ enum PanelView {
     Decisions,
     AgentJobs,
     Projects,
+    /// A dedicated full-panel view for one job's transcript, reached from
+    /// Feed or Agent Jobs — not an inline expander, so a long transcript
+    /// gets the whole panel instead of a cramped scrolling sub-box, and so
+    /// it can carry its own search.
+    Transcript,
+}
+
+/// One row of the grouped feed — either a standalone event, or every event
+/// sharing one `agent_job_id` collapsed into a single group. Mirrors
+/// `feed-panel.tsx`'s `FeedItem` type in the web dashboard. Owns clones
+/// (feed lists are small — capped at 50 per fetch) rather than borrowing,
+/// so building this doesn't hold a live borrow of `self` across the rest
+/// of `render_feed_view`, which also needs `&mut self`.
+enum FeedItem {
+    Single(FeedEvent),
+    Group { job_id: String, events: Vec<FeedEvent> },
+}
+
+/// Release/Report-session-closed are one-way handoff actions, so they go
+/// through an explicit confirm step (`confirming_job_action`) instead of
+/// firing on the first click — matching the equivalent fix already made in
+/// the web dashboard.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum JobAction {
+    Release,
+    Close,
 }
 
 /// Mirrors the backend's `Project` row, trimmed to what the switcher
@@ -364,8 +408,22 @@ pub struct ProjectBrainPanel {
     /// The agent job whose steering-message composer is currently expanded,
     /// if any.
     expanded_job_id: Option<String>,
-    /// The agent job whose live transcript is currently expanded, if any.
-    expanded_transcript_job_id: Option<String>,
+    /// Which job the dedicated Transcript view is currently showing, if
+    /// it's open.
+    transcript_job_id: Option<String>,
+    /// Which view "Back" from Transcript returns to — wherever it was
+    /// opened from (Feed or Agent Jobs), not always the same place.
+    transcript_return_view: PanelView,
+    /// Read directly at render time (no backend call needed for a purely
+    /// client-side filter over already-fetched turns, unlike
+    /// `search_editor`'s explicit-submit search) — live-as-you-type.
+    transcript_search_editor: Entity<Editor>,
+    /// Index into the current search's matching turns — which one "next
+    /// match" scrolls to.
+    transcript_match_index: usize,
+    /// One-way agent job actions (Release, Report session closed) awaiting
+    /// an explicit confirm click before they actually fire.
+    confirming_job_action: Option<(String, JobAction)>,
     /// Session turns fetched/streamed per agent job id.
     job_turns: std::collections::HashMap<String, Vec<SessionTurn>>,
     steering_editor: Entity<Editor>,
@@ -508,6 +566,11 @@ impl ProjectBrainPanel {
             editor.set_placeholder_text("New project name…", window, cx);
             editor
         });
+        let transcript_search_editor = cx.new(|cx| {
+            let mut editor = Editor::single_line(window, cx);
+            editor.set_placeholder_text("Search this transcript…", window, cx);
+            editor
+        });
 
         let mut this = Self {
             workspace: workspace.weak_handle(),
@@ -521,7 +584,11 @@ impl ProjectBrainPanel {
             connection_status: ConnectionStatus::Connecting,
             brief: None,
             expanded_job_id: None,
-            expanded_transcript_job_id: None,
+            transcript_job_id: None,
+            transcript_return_view: PanelView::AgentJobs,
+            transcript_search_editor,
+            transcript_match_index: 0,
+            confirming_job_action: None,
             job_turns: std::collections::HashMap::new(),
             steering_editor,
             action_status: None,
@@ -740,6 +807,7 @@ impl ProjectBrainPanel {
                         entity_id: Some(job.id.clone()),
                         verb: Some(job.status.clone()),
                         summary: job.goal.clone(),
+                        agent_job_id: Some(job.id.clone()),
                         created_at: Some(Utc::now()),
                     },
                     cx,
@@ -1253,7 +1321,7 @@ impl ProjectBrainPanel {
             return;
         }
         self.expanded_job_id = None;
-        self.expanded_transcript_job_id = Some(job_id.clone());
+        self.open_transcript(job_id.clone(), cx);
 
         let url = format!("{}/agent-jobs/{}/turns", backend_base_url(), job_id);
         let body = serde_json::json!({ "actor_id": actor_id, "content": content });
@@ -1279,13 +1347,25 @@ impl ProjectBrainPanel {
         .detach();
     }
 
-    fn toggle_transcript(&mut self, job_id: String, cx: &mut Context<Self>) {
-        if self.expanded_transcript_job_id.as_deref() == Some(job_id.as_str()) {
-            self.expanded_transcript_job_id = None;
-            cx.notify();
-            return;
+    /// Switches the whole panel to the dedicated Transcript view for
+    /// `job_id` — not an inline expander, so a long transcript gets full
+    /// room instead of a cramped scrolling sub-box, and it can carry its
+    /// own search. Remembers whichever view it was opened from (Feed or
+    /// Agent Jobs) so "Back" returns there, not always the same place.
+    fn open_transcript(&mut self, job_id: String, cx: &mut Context<Self>) {
+        if self.active_view != PanelView::Transcript {
+            self.transcript_return_view = self.active_view;
         }
-        self.expanded_transcript_job_id = Some(job_id.clone());
+        self.transcript_job_id = Some(job_id.clone());
+        self.active_view = PanelView::Transcript;
+        self.transcript_match_index = 0;
+        if !self.job_turns.contains_key(&job_id) {
+            self.fetch_transcript(job_id, cx);
+        }
+        cx.notify();
+    }
+
+    fn fetch_transcript(&mut self, job_id: String, cx: &mut Context<Self>) {
         cx.spawn(async move |this: WeakEntity<Self>, cx: &mut AsyncApp| {
             let result = tokio_runtime().spawn(fetch_turns(job_id.clone())).await;
             if let Ok(Ok(turns)) = result {
@@ -1296,6 +1376,77 @@ impl ProjectBrainPanel {
             }
         })
         .detach();
+    }
+
+    fn close_transcript(&mut self, cx: &mut Context<Self>) {
+        self.active_view = self.transcript_return_view;
+        self.transcript_job_id = None;
+        cx.notify();
+    }
+
+    /// The current owner's explicit consent to be displaced — only they may
+    /// call this on their own job. Goes through `confirming_job_action`
+    /// first; this is the actual fire.
+    fn release_job(&mut self, job_id: String, cx: &mut Context<Self>) {
+        let Some(actor_id) = self.actor_id.clone() else {
+            self.action_status = Some("Create an actor above to release jobs".into());
+            cx.notify();
+            return;
+        };
+        let token = self.actor_token.clone();
+        self.confirming_job_action = None;
+        let url = format!("{}/agent-jobs/{}/release", backend_base_url(), job_id);
+        let body = serde_json::json!({ "actor_id": actor_id });
+        cx.spawn(async move |this: WeakEntity<Self>, cx: &mut AsyncApp| {
+            let result = tokio_runtime().spawn(post_json(url, body, token)).await;
+            let status = match result {
+                Ok(Ok(())) => Some("Released".to_string()),
+                Ok(Err(err)) => Some(format!("Release failed: {err:#}")),
+                Err(err) => Some(format!("Release failed: {err:#}")),
+            };
+            let _ = this.update(cx, |panel, cx| {
+                panel.action_status = status;
+                panel.refresh_project_context(cx);
+            });
+        })
+        .detach();
+    }
+
+    /// Reports that this actor's own session on this job has ended — the
+    /// other (non-consent) condition under which a different actor may
+    /// claim it.
+    fn report_session_closed(&mut self, job_id: String, cx: &mut Context<Self>) {
+        let Some(actor_id) = self.actor_id.clone() else {
+            self.action_status = Some("Create an actor above to report a session closed".into());
+            cx.notify();
+            return;
+        };
+        let token = self.actor_token.clone();
+        self.confirming_job_action = None;
+        let url = format!("{}/agent-jobs/{}/close-session", backend_base_url(), job_id);
+        let body = serde_json::json!({ "actor_id": actor_id });
+        cx.spawn(async move |this: WeakEntity<Self>, cx: &mut AsyncApp| {
+            let result = tokio_runtime().spawn(post_json(url, body, token)).await;
+            let status = match result {
+                Ok(Ok(())) => Some("Session marked closed".to_string()),
+                Ok(Err(err)) => Some(format!("Report session closed failed: {err:#}")),
+                Err(err) => Some(format!("Report session closed failed: {err:#}")),
+            };
+            let _ = this.update(cx, |panel, cx| {
+                panel.action_status = status;
+                panel.refresh_project_context(cx);
+            });
+        })
+        .detach();
+    }
+
+    fn request_job_action(&mut self, job_id: String, action: JobAction, cx: &mut Context<Self>) {
+        self.confirming_job_action = Some((job_id, action));
+        cx.notify();
+    }
+
+    fn cancel_job_action(&mut self, cx: &mut Context<Self>) {
+        self.confirming_job_action = None;
         cx.notify();
     }
 
@@ -1820,7 +1971,13 @@ impl ProjectBrainPanel {
         self.connection_status = ConnectionStatus::Connecting;
         self.brief = None;
         self.expanded_job_id = None;
-        self.expanded_transcript_job_id = None;
+        self.transcript_job_id = None;
+        self.active_view = if self.active_view == PanelView::Transcript {
+            PanelView::Feed
+        } else {
+            self.active_view
+        };
+        self.confirming_job_action = None;
         self.job_turns.clear();
         self.pending_duplicate = None;
         self.search_results.clear();
@@ -1908,7 +2065,15 @@ impl ProjectBrainPanel {
             .border_b_1()
             .border_color(cx.theme().colors().border)
             .children(tabs.into_iter().map(|(view, label)| {
-                let is_active = self.active_view == view;
+                // While Transcript is open, keep whichever tab it was
+                // reached from looking active — Transcript itself isn't a
+                // real tab, just a drill-in.
+                let effective_view = if self.active_view == PanelView::Transcript {
+                    self.transcript_return_view
+                } else {
+                    self.active_view
+                };
+                let is_active = effective_view == view;
                 Button::new(format!("panel-tab-{label}"), label)
                     .label_size(LabelSize::Small)
                     .color(if is_active { Color::Accent } else { Color::Muted })
@@ -1980,6 +2145,12 @@ impl ProjectBrainPanel {
         if self.active_view == PanelView::Projects {
             return self.render_projects_view(cx);
         }
+        // Transcript doesn't need `brief` either — it renders one job's
+        // turns by id, already fetched independently of the shared-memory
+        // summary.
+        if self.active_view == PanelView::Transcript {
+            return self.render_transcript_view(cx);
+        }
         let Some(brief) = self.brief.clone() else {
             return Label::new("Loading shared memory…")
                 .size(LabelSize::Small)
@@ -1992,7 +2163,7 @@ impl ProjectBrainPanel {
             PanelView::Investigations => self.render_investigations_view(&brief, cx),
             PanelView::Decisions => self.render_decisions_view(cx),
             PanelView::AgentJobs => self.render_agent_jobs_view(&brief, cx),
-            PanelView::Projects => unreachable!(),
+            PanelView::Projects | PanelView::Transcript => unreachable!(),
         }
     }
 
@@ -2127,7 +2298,37 @@ impl ProjectBrainPanel {
         root.into_any_element()
     }
 
+    /// Events sharing an `agent_job_id` collapse into one group, positioned
+    /// at that job's most recent event — `feed_events` is already
+    /// newest-first (`push_feed_event` inserts at index 0), so the first
+    /// occurrence of a job id is already its newest event; no separate sort
+    /// needed. Events with no `agent_job_id` render individually, unchanged.
+    /// Mirrors `feed-panel.tsx`'s `groupByJob` in the web dashboard.
+    fn group_feed_events(&self) -> Vec<FeedItem> {
+        let mut items = Vec::new();
+        let mut seen_job_ids = std::collections::HashSet::new();
+        for event in &self.feed_events {
+            match &event.agent_job_id {
+                None => items.push(FeedItem::Single(event.clone())),
+                Some(job_id) => {
+                    if !seen_job_ids.insert(job_id.clone()) {
+                        continue;
+                    }
+                    let events: Vec<FeedEvent> = self
+                        .feed_events
+                        .iter()
+                        .filter(|e| e.agent_job_id.as_deref() == Some(job_id.as_str()))
+                        .cloned()
+                        .collect();
+                    items.push(FeedItem::Group { job_id: job_id.clone(), events });
+                }
+            }
+        }
+        items
+    }
+
     fn render_feed_view(&mut self, cx: &mut Context<Self>) -> gpui::AnyElement {
+        let items = self.group_feed_events();
         v_flex()
             .gap_2()
             .child(self.render_search_section(cx))
@@ -2137,7 +2338,7 @@ impl ProjectBrainPanel {
                     .child(
                         Label::new("PROJECT FEED").size(LabelSize::XSmall).color(Color::Muted),
                     )
-                    .child(if self.feed_events.is_empty() {
+                    .child(if items.is_empty() {
                         v_flex().id("project-brain-feed-list").p_2().child(
                             Label::new("No feed events recorded yet.")
                                 .size(LabelSize::Small)
@@ -2147,39 +2348,115 @@ impl ProjectBrainPanel {
                         v_flex()
                             .id("project-brain-feed-list")
                             .gap_2()
-                            .children(self.feed_events.iter().map(|event| {
-                                let relative_time = format_relative_time(event.created_at);
-                                let verb_badge = event.verb.as_deref().unwrap_or("");
-
-                                v_flex()
-                                    .p_2()
-                                    .rounded_md()
-                                    .bg(cx.theme().colors().element_background)
-                                    .gap_1()
-                                    .child(
-                                        h_flex().justify_between().items_center().child(
-                                            Label::new(event.summary.clone()).size(LabelSize::Small),
-                                        ),
-                                    )
-                                    .child(
-                                        h_flex()
-                                            .justify_between()
-                                            .items_center()
-                                            .when(!verb_badge.is_empty(), |this| {
-                                                this.child(
-                                                    Label::new(verb_badge.to_string())
-                                                        .size(LabelSize::XSmall)
-                                                        .color(Color::Muted),
-                                                )
-                                            })
-                                            .child(
-                                                Label::new(relative_time)
-                                                    .size(LabelSize::XSmall)
-                                                    .color(Color::Muted),
-                                            ),
-                                    )
+                            .children(items.into_iter().map(|item| match item {
+                                FeedItem::Single(event) => self.render_feed_event_row(&event, cx),
+                                FeedItem::Group { job_id, events } => {
+                                    self.render_feed_job_group(&job_id, &events, cx)
+                                }
                             }))
                     }),
+            )
+            .into_any_element()
+    }
+
+    fn render_feed_event_row(&self, event: &FeedEvent, cx: &mut Context<Self>) -> gpui::AnyElement {
+        let relative_time = format_relative_time(event.created_at);
+        let verb_badge = event.verb.as_deref().unwrap_or("");
+
+        v_flex()
+            .p_2()
+            .rounded_md()
+            .bg(cx.theme().colors().element_background)
+            .gap_1()
+            .child(
+                h_flex().justify_between().items_center().child(
+                    Label::new(event.summary.clone()).size(LabelSize::Small),
+                ),
+            )
+            .child(
+                h_flex()
+                    .justify_between()
+                    .items_center()
+                    .when(!verb_badge.is_empty(), |this| {
+                        this.child(
+                            Label::new(verb_badge.to_string())
+                                .size(LabelSize::XSmall)
+                                .color(Color::Muted),
+                        )
+                    })
+                    .child(
+                        Label::new(relative_time)
+                            .size(LabelSize::XSmall)
+                            .color(Color::Muted),
+                    ),
+            )
+            .into_any_element()
+    }
+
+    /// One collapsed row representing every event linked to `job_id` — the
+    /// title is the job's own goal when known (falls back to the newest
+    /// event's own summary otherwise), with a status pill, event count, and
+    /// a direct link into the dedicated Transcript view. Unlike the web
+    /// dashboard's version this doesn't have an intermediate
+    /// expand-to-see-individual-events step — a deliberate scope trim for
+    /// the native panel; "View Transcript" goes straight to the real data.
+    fn render_feed_job_group(
+        &self,
+        job_id: &str,
+        events: &[FeedEvent],
+        cx: &mut Context<Self>,
+    ) -> gpui::AnyElement {
+        let newest = &events[0];
+        let job = self
+            .brief
+            .as_ref()
+            .and_then(|brief| brief.active_agent_jobs.iter().find(|j| j.id == job_id));
+        let title = job.map(|j| j.goal.clone()).unwrap_or_else(|| newest.summary.clone());
+        let status_label = job.map(|j| j.status.clone());
+        let relative_time = format_relative_time(newest.created_at);
+        let count = events.len();
+        let open_job_id = job_id.to_string();
+
+        v_flex()
+            .p_2()
+            .rounded_md()
+            .bg(cx.theme().colors().element_background)
+            .gap_1()
+            .child(
+                h_flex()
+                    .justify_between()
+                    .items_start()
+                    .gap_2()
+                    .child(Label::new(title).size(LabelSize::Small).truncate())
+                    .when_some(status_label, |this, status| {
+                        this.child(
+                            Label::new(status.clone())
+                                .size(LabelSize::XSmall)
+                                .color(status_color(&status)),
+                        )
+                    }),
+            )
+            .child(
+                h_flex()
+                    .gap_1p5()
+                    .child(
+                        Label::new(format!("{count} {}", if count == 1 { "event" } else { "events" }))
+                            .size(LabelSize::XSmall)
+                            .color(Color::Muted),
+                    )
+                    .child(Label::new("·").size(LabelSize::XSmall).color(Color::Muted))
+                    .child(
+                        Label::new(relative_time)
+                            .size(LabelSize::XSmall)
+                            .color(Color::Muted),
+                    ),
+            )
+            .child(
+                Button::new(format!("feed-transcript-{job_id}"), "View Transcript")
+                    .label_size(LabelSize::Small)
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        this.open_transcript(open_job_id.clone(), cx);
+                    })),
             )
             .into_any_element()
     }
@@ -2618,12 +2895,21 @@ impl ProjectBrainPanel {
         let message_job_id = job_id.clone();
         let transcript_job_id = job_id.clone();
         let is_expanded = self.expanded_job_id.as_deref() == Some(job_id.as_str());
-        let is_transcript_expanded =
-            self.expanded_transcript_job_id.as_deref() == Some(job_id.as_str());
         let claimed_by = job
             .claimed_by_actor_id
             .as_deref()
             .map(|id| self.display_name_for(id));
+        let is_owner = self.actor_id.is_some() && self.actor_id == job.claimed_by_actor_id;
+        let is_active_owner_session = job.owner_session_status == "active";
+        // Only succeeds on the backend once the current owner has released
+        // it or reported their session closed — mirrors that gate here so
+        // the button doesn't invite a doomed request.
+        let claim_blocked = is_active_owner_session && !is_owner;
+        let confirming = self
+            .confirming_job_action
+            .as_ref()
+            .filter(|(id, _)| id == &job_id)
+            .map(|(_, action)| *action);
 
         let mut row = v_flex()
             .gap_1()
@@ -2647,19 +2933,91 @@ impl ProjectBrainPanel {
                     ),
             )
             .child(
-                Label::new(match &claimed_by {
-                    Some(name) => format!("Claimed by {name}"),
-                    None => "Unclaimed".to_string(),
-                })
-                .size(LabelSize::XSmall)
-                .color(Color::Muted),
-            )
-            .child(
+                h_flex()
+                    .gap_1p5()
+                    .child(
+                        Label::new(match &claimed_by {
+                            Some(name) => format!("Claimed by {name}"),
+                            None => "Unclaimed".to_string(),
+                        })
+                        .size(LabelSize::XSmall)
+                        .color(Color::Muted),
+                    )
+                    .when(claimed_by.is_some(), |this| {
+                        this.child(
+                            Label::new(format!(
+                                "· {}",
+                                match job.owner_session_status.as_str() {
+                                    "released" => "released",
+                                    "closed" => "session closed",
+                                    _ => "active",
+                                }
+                            ))
+                            .size(LabelSize::XSmall)
+                            .color(Color::Muted),
+                        )
+                    }),
+            );
+
+        if let Some(action) = confirming {
+            let confirm_job_id = job_id.clone();
+            let (prompt, confirm_label, confirm_color): (&str, &str, Color) = match action {
+                JobAction::Release => (
+                    "Release this job for handoff?",
+                    "Confirm Release",
+                    Color::Warning,
+                ),
+                JobAction::Close => (
+                    "Report your session on this job as closed?",
+                    "Confirm Closed",
+                    Color::Error,
+                ),
+            };
+            row = row.child(
+                v_flex()
+                    .gap_1()
+                    .p_2()
+                    .rounded_md()
+                    .border_1()
+                    .border_color(confirm_color.color(cx))
+                    .child(Label::new(prompt).size(LabelSize::Small))
+                    .child(
+                        h_flex()
+                            .gap_2()
+                            .child(
+                                Button::new(format!("confirm-job-action-{job_id}"), confirm_label)
+                                    .label_size(LabelSize::Small)
+                                    .color(confirm_color)
+                                    .on_click(cx.listener(move |this, _, _, cx| {
+                                        match action {
+                                            JobAction::Release => {
+                                                this.release_job(confirm_job_id.clone(), cx)
+                                            }
+                                            JobAction::Close => this
+                                                .report_session_closed(confirm_job_id.clone(), cx),
+                                        }
+                                    })),
+                            )
+                            .child(
+                                Button::new(format!("cancel-job-action-{job_id}"), "Cancel")
+                                    .label_size(LabelSize::Small)
+                                    .on_click(cx.listener(|this, _, _, cx| {
+                                        this.cancel_job_action(cx);
+                                    })),
+                            ),
+                    ),
+            );
+        } else {
+            let release_job_id = job_id.clone();
+            let close_job_id = job_id.clone();
+            row = row.child(
                 h_flex()
                     .gap_2()
+                    .flex_wrap()
                     .child(
                         Button::new(format!("claim-{job_id}"), "Claim")
                             .label_size(LabelSize::Small)
+                            .disabled(claim_blocked)
                             .on_click(cx.listener(move |this, _, _, cx| {
                                 this.claim_job(claim_job_id.clone(), cx);
                             })),
@@ -2672,20 +3030,49 @@ impl ProjectBrainPanel {
                             })),
                     )
                     .child(
-                        Button::new(
-                            format!("transcript-{job_id}"),
-                            if is_transcript_expanded {
-                                "Hide Transcript"
-                            } else {
-                                "Transcript"
-                            },
+                        Button::new(format!("transcript-{job_id}"), "Transcript")
+                            .label_size(LabelSize::Small)
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                this.open_transcript(transcript_job_id.clone(), cx);
+                            })),
+                    )
+                    .when(is_owner && is_active_owner_session, |this| {
+                        this.child(
+                            Button::new(format!("release-{release_job_id}"), "Release")
+                                .label_size(LabelSize::Small)
+                                .color(Color::Warning)
+                                .on_click(cx.listener(move |this, _, _, cx| {
+                                    this.request_job_action(
+                                        release_job_id.clone(),
+                                        JobAction::Release,
+                                        cx,
+                                    );
+                                })),
                         )
-                        .label_size(LabelSize::Small)
-                        .on_click(cx.listener(move |this, _, _, cx| {
-                            this.toggle_transcript(transcript_job_id.clone(), cx);
-                        })),
-                    ),
+                        .child(
+                            Button::new(format!("close-{close_job_id}"), "Report Closed")
+                                .label_size(LabelSize::Small)
+                                .color(Color::Error)
+                                .on_click(cx.listener(move |this, _, _, cx| {
+                                    this.request_job_action(
+                                        close_job_id.clone(),
+                                        JobAction::Close,
+                                        cx,
+                                    );
+                                })),
+                        )
+                    }),
             );
+            if claim_blocked {
+                row = row.child(
+                    Label::new(
+                        "Still actively owned — its owner must release it or report their session closed first.",
+                    )
+                    .size(LabelSize::XSmall)
+                    .color(Color::Muted),
+                );
+            }
+        }
 
         if is_expanded {
             let send_job_id = job_id.clone();
@@ -2731,47 +3118,14 @@ impl ProjectBrainPanel {
             );
         }
 
-        if is_transcript_expanded {
-            row = row.child(self.render_transcript(&job_id, cx));
-        }
-
         row.into_any_element()
     }
 
-    fn render_transcript(&self, job_id: &str, cx: &mut Context<Self>) -> gpui::AnyElement {
-        let Some(turns) = self.job_turns.get(job_id) else {
-            return Label::new("Loading transcript…")
-                .size(LabelSize::XSmall)
-                .color(Color::Muted)
-                .into_any_element();
-        };
-        if turns.is_empty() {
-            return Label::new("No turns yet.")
-                .size(LabelSize::XSmall)
-                .color(Color::Muted)
-                .into_any_element();
-        }
-
-        v_flex()
-            .id(format!("transcript-list-{job_id}"))
-            .gap_1p5()
-            .max_h(px(240.))
-            .overflow_y_scroll()
-            .p_1()
-            .rounded_md()
-            .bg(cx.theme().colors().editor_background)
-            .children(turns.iter().map(|turn| Self::render_turn(turn)))
-            .into_any_element()
-    }
-
-    fn render_turn(turn: &SessionTurn) -> gpui::AnyElement {
-        let (role_label, role_color) = match turn.role {
-            TurnRole::User => ("USER", Color::Accent),
-            TurnRole::Assistant => ("ASSISTANT", Color::Default),
-            TurnRole::Tool => ("TOOL RESULT", Color::Muted),
-        };
-
-        let body = if let Some(content) = &turn.content {
+    /// Turn body text — the same fallback a tool-call turn (no `content`)
+    /// gets rendered as, used both for display and for what search matches
+    /// against.
+    fn turn_body(turn: &SessionTurn) -> String {
+        if let Some(content) = &turn.content {
             content.clone()
         } else if let Some(tool_name) = &turn.tool_name {
             let input = turn
@@ -2782,10 +3136,199 @@ impl ProjectBrainPanel {
             format!("→ {tool_name}({input})")
         } else {
             String::new()
+        }
+    }
+
+    /// Searched against tool name and raw params too, so a query for a
+    /// tool argument finds the turn even when it never appears in the
+    /// displayed body's fallback formatting.
+    fn turn_search_text(turn: &SessionTurn) -> String {
+        let mut text = Self::turn_body(turn);
+        if let Some(tool_name) = &turn.tool_name {
+            text.push(' ');
+            text.push_str(tool_name);
+        }
+        text
+    }
+
+    /// The dedicated, full-panel Transcript view — not an inline expander,
+    /// so a long transcript gets the whole panel instead of a cramped
+    /// scrolling sub-box, and it carries its own live search.
+    fn render_transcript_view(&mut self, cx: &mut Context<Self>) -> gpui::AnyElement {
+        let Some(job_id) = self.transcript_job_id.clone() else {
+            return Label::new("No transcript selected.")
+                .size(LabelSize::Small)
+                .color(Color::Muted)
+                .into_any_element();
         };
 
-        v_flex()
-            .gap_0p5()
+        let job_title = self
+            .brief
+            .as_ref()
+            .and_then(|brief| brief.active_agent_jobs.iter().find(|j| j.id == job_id))
+            .map(|j| j.goal.clone());
+
+        let mut root = v_flex()
+            .gap_2()
+            .child(
+                Button::new("transcript-back", "← Back")
+                    .label_size(LabelSize::Small)
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        this.close_transcript(cx);
+                    })),
+            )
+            .child(
+                Label::new(job_title.unwrap_or_else(|| "Transcript".to_string()))
+                    .size(LabelSize::Default)
+                    .weight(gpui::FontWeight::SEMIBOLD),
+            )
+            .child(
+                div()
+                    .rounded_md()
+                    .border_1()
+                    .border_color(cx.theme().colors().border)
+                    .px_2()
+                    .py_1()
+                    .child(self.transcript_search_editor.clone()),
+            );
+
+        let Some(turns) = self.job_turns.get(&job_id) else {
+            return root
+                .child(
+                    Label::new("Loading transcript…")
+                        .size(LabelSize::Small)
+                        .color(Color::Muted),
+                )
+                .into_any_element();
+        };
+
+        if turns.is_empty() {
+            return root
+                .child(
+                    Label::new("No turns recorded yet.")
+                        .size(LabelSize::Small)
+                        .color(Color::Muted),
+                )
+                .into_any_element();
+        }
+
+        let query = self.transcript_search_editor.read(cx).text(cx).trim().to_lowercase();
+        let matching_ids: Vec<String> = if query.is_empty() {
+            Vec::new()
+        } else {
+            turns
+                .iter()
+                .filter(|turn| Self::turn_search_text(turn).to_lowercase().contains(&query))
+                .map(|turn| turn.id.clone())
+                .collect()
+        };
+
+        if !query.is_empty() {
+            if self.transcript_match_index >= matching_ids.len().max(1) {
+                self.transcript_match_index = 0;
+            }
+            root = root.child(
+                h_flex()
+                    .gap_2()
+                    .items_center()
+                    .child(
+                        Label::new(if matching_ids.is_empty() {
+                            "0 matches".to_string()
+                        } else {
+                            format!("{} of {}", self.transcript_match_index + 1, matching_ids.len())
+                        })
+                        .size(LabelSize::XSmall)
+                        .color(Color::Muted),
+                    )
+                    .child(
+                        Button::new("transcript-prev-match", "↑")
+                            .label_size(LabelSize::Small)
+                            .disabled(matching_ids.is_empty())
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.step_transcript_match(-1, cx);
+                            })),
+                    )
+                    .child(
+                        Button::new("transcript-next-match", "↓")
+                            .label_size(LabelSize::Small)
+                            .disabled(matching_ids.is_empty())
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.step_transcript_match(1, cx);
+                            })),
+                    ),
+            );
+        }
+
+        let active_id = if query.is_empty() {
+            None
+        } else {
+            matching_ids.get(self.transcript_match_index).cloned()
+        };
+
+        root.child(
+            v_flex()
+                .id(format!("transcript-list-{job_id}"))
+                .gap_1p5()
+                .flex_1()
+                .overflow_y_scroll()
+                .p_1()
+                .rounded_md()
+                .bg(cx.theme().colors().editor_background)
+                .children(turns.iter().map(|turn| {
+                    let is_match = matching_ids.contains(&turn.id);
+                    let is_active = Some(&turn.id) == active_id.as_ref();
+                    Self::render_turn(turn, is_match, is_active, cx)
+                })),
+        )
+        .into_any_element()
+    }
+
+    fn step_transcript_match(&mut self, delta: i64, cx: &mut Context<Self>) {
+        let Some(job_id) = self.transcript_job_id.clone() else {
+            return;
+        };
+        let query = self.transcript_search_editor.read(cx).text(cx).trim().to_lowercase();
+        if query.is_empty() {
+            return;
+        }
+        let Some(turns) = self.job_turns.get(&job_id) else {
+            return;
+        };
+        let count = turns
+            .iter()
+            .filter(|turn| Self::turn_search_text(turn).to_lowercase().contains(&query))
+            .count();
+        if count == 0 {
+            return;
+        }
+        let current = self.transcript_match_index as i64;
+        let next = ((current + delta).rem_euclid(count as i64)) as usize;
+        self.transcript_match_index = next;
+        cx.notify();
+    }
+
+    fn render_turn(
+        turn: &SessionTurn,
+        is_match: bool,
+        is_active: bool,
+        cx: &mut Context<Self>,
+    ) -> gpui::AnyElement {
+        let (role_label, role_color) = match turn.role {
+            TurnRole::User => ("USER", Color::Accent),
+            TurnRole::Assistant => ("ASSISTANT", Color::Default),
+            TurnRole::Tool => ("TOOL RESULT", Color::Muted),
+        };
+
+        let body = Self::turn_body(turn);
+
+        let mut container = v_flex().gap_0p5().p_1().rounded_md();
+        if is_active {
+            container = container.bg(Color::Warning.color(cx).opacity(0.16));
+        } else if is_match {
+            container = container.bg(cx.theme().colors().element_background);
+        }
+
+        container
             .child(Label::new(role_label).size(LabelSize::XSmall).color(role_color))
             .child(Label::new(body).size(LabelSize::Small))
             .into_any_element()
