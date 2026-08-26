@@ -85,9 +85,27 @@ fn rally_onboarding_snippet() -> String {
          session, before anything else, call `get_project_context` to see what's \
          already been done — other agents and humans share this project's memory. \
          Starting a new task? Call `create_agent_job` first with the human's \
-         actual request as `goal`, then `report_activity` as you work.\n\
+         actual request as `goal`, then `report_activity` as you work. Before \
+         starting each new step, call `check_steering_messages` with your job id \
+         — nothing else interrupts you, so this is the only way you'll notice if \
+         a human redirected you.\n\
          <!-- /rally-project-brain:onboarding -->"
     )
+}
+
+/// Replaces the span from `RALLY_MARKER` through the next `-->` after it
+/// (the closing tag, whatever its exact text) with `snippet`. `None` if the
+/// marker isn't present at all.
+fn replace_marked_block(content: &str, snippet: &str) -> Option<String> {
+    let start = content.find(RALLY_MARKER)?;
+    let after_start = start + RALLY_MARKER.len();
+    let close_offset = content[after_start..].find("-->")?;
+    let end = after_start + close_offset + "-->".len();
+    let mut result = String::with_capacity(content.len());
+    result.push_str(&content[..start]);
+    result.push_str(snippet);
+    result.push_str(&content[end..]);
+    Some(result)
 }
 
 /// Writes (or appends to, if one already exists and lacks the marker) the
@@ -121,7 +139,16 @@ pub async fn write_onboarding_instructions(fs: Arc<dyn Fs>, worktree_root: PathB
             Some(content) if !content.contains(RALLY_MARKER) => {
                 format!("{}\n\n{snippet}\n", content.trim_end())
             }
-            Some(_) => continue, // marker already present, don't duplicate
+            // Marker from an earlier run is already there — replace that
+            // whole block in place instead of skipping. Skipping meant a
+            // snippet-text change (like the check_steering_messages line
+            // just added) would never reach a project onboarded before the
+            // change, since "marker present" was treated as "nothing to do"
+            // forever.
+            Some(content) => match replace_marked_block(&content, &snippet) {
+                Some(replaced) if replaced != content => replaced,
+                _ => continue,
+            },
         };
 
         if let Err(err) = fs.atomic_write(path.clone(), new_content).await {
