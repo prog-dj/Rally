@@ -184,8 +184,6 @@ pub struct LiveAgentJob {
     pub status: String,
     #[serde(default)]
     pub claimed_by_actor_id: Option<String>,
-    #[serde(default = "default_owner_session_status")]
-    pub owner_session_status: String,
 }
 
 /// Whether `claimed_by_actor_id` can be displaced by a different actor —
@@ -2139,17 +2137,17 @@ impl ProjectBrainPanel {
     }
 
     fn render_active_view(&mut self, cx: &mut Context<Self>) -> gpui::AnyElement {
-        // Projects doesn't depend on `brief` (shared project memory) — it's
-        // the view you use *before* a project is even selected, so it can't
-        // gate on the same "brief loaded" check every other tab does.
-        if self.active_view == PanelView::Projects {
-            return self.render_projects_view(cx);
-        }
-        // Transcript doesn't need `brief` either — it renders one job's
-        // turns by id, already fetched independently of the shared-memory
-        // summary.
-        if self.active_view == PanelView::Transcript {
-            return self.render_transcript_view(cx);
+        match self.active_view {
+            // Projects doesn't depend on `brief` (shared project memory) —
+            // it's the view you use *before* a project is even selected, so
+            // it can't gate on the same "brief loaded" check every other
+            // tab does.
+            PanelView::Projects => return self.render_projects_view(cx),
+            // Transcript doesn't need `brief` either — it renders one job's
+            // turns by id, already fetched independently of the
+            // shared-memory summary.
+            PanelView::Transcript => return self.render_transcript_view(cx),
+            _ => {}
         }
         let Some(brief) = self.brief.clone() else {
             return Label::new("Loading shared memory…")
@@ -2163,7 +2161,9 @@ impl ProjectBrainPanel {
             PanelView::Investigations => self.render_investigations_view(&brief, cx),
             PanelView::Decisions => self.render_decisions_view(cx),
             PanelView::AgentJobs => self.render_agent_jobs_view(&brief, cx),
-            PanelView::Projects | PanelView::Transcript => unreachable!(),
+            PanelView::Projects | PanelView::Transcript => {
+                unreachable!("handled by the early return above")
+            }
         }
     }
 
@@ -2429,11 +2429,7 @@ impl ProjectBrainPanel {
                     .gap_2()
                     .child(Label::new(title).size(LabelSize::Small).truncate())
                     .when_some(status_label, |this, status| {
-                        this.child(
-                            Label::new(status.clone())
-                                .size(LabelSize::XSmall)
-                                .color(status_color(&status)),
-                        )
+                        this.child(status_pill(&status))
                     }),
             )
             .child(
@@ -2926,11 +2922,7 @@ impl ProjectBrainPanel {
                             .size(LabelSize::Small)
                             .truncate(),
                     )
-                    .child(
-                        Label::new(job.status.clone())
-                            .size(LabelSize::XSmall)
-                            .color(status_color(&job.status)),
-                    ),
+                    .child(status_pill(&job.status)),
             )
             .child(
                 h_flex()
@@ -3013,7 +3005,6 @@ impl ProjectBrainPanel {
             row = row.child(
                 h_flex()
                     .gap_2()
-                    .flex_wrap()
                     .child(
                         Button::new(format!("claim-{job_id}"), "Claim")
                             .label_size(LabelSize::Small)
@@ -3035,9 +3026,18 @@ impl ProjectBrainPanel {
                             .on_click(cx.listener(move |this, _, _, cx| {
                                 this.open_transcript(transcript_job_id.clone(), cx);
                             })),
-                    )
-                    .when(is_owner && is_active_owner_session, |this| {
-                        this.child(
+                    ),
+            );
+            // Kept on its own row rather than appended to the primary
+            // button row above: only the owner ever sees these two, so the
+            // common (non-owner) case stays single-line at the panel's
+            // ~320px width instead of every row reserving wrap risk for a
+            // rarer state.
+            if is_owner && is_active_owner_session {
+                row = row.child(
+                    h_flex()
+                        .gap_2()
+                        .child(
                             Button::new(format!("release-{release_job_id}"), "Release")
                                 .label_size(LabelSize::Small)
                                 .color(Color::Warning)
@@ -3060,9 +3060,9 @@ impl ProjectBrainPanel {
                                         cx,
                                     );
                                 })),
-                        )
-                    }),
-            );
+                        ),
+                );
+            }
             if claim_blocked {
                 row = row.child(
                     Label::new(
@@ -3128,11 +3128,22 @@ impl ProjectBrainPanel {
         if let Some(content) = &turn.content {
             content.clone()
         } else if let Some(tool_name) = &turn.tool_name {
-            let input = turn
+            let raw = turn
                 .tool_input
                 .as_ref()
                 .map(|v| v.to_string())
                 .unwrap_or_default();
+            // Capped so one large tool call (a full file write, a long
+            // diff) can't dominate the transcript view's vertical rhythm in
+            // a narrow docked panel — every other label in this file
+            // truncates for the same reason.
+            const MAX_INPUT_CHARS: usize = 200;
+            let input = if raw.chars().count() > MAX_INPUT_CHARS {
+                let truncated: String = raw.chars().take(MAX_INPUT_CHARS).collect();
+                format!("{truncated}…")
+            } else {
+                raw
+            };
             format!("→ {tool_name}({input})")
         } else {
             String::new()
@@ -4063,6 +4074,15 @@ fn status_color(status: &str) -> Color {
         "failed" | "blocked" => Color::Error,
         _ => Color::Muted,
     }
+}
+
+/// The small XSmall/`status_color`-toned status label used on both the feed's
+/// job-group row and the agent-jobs tab's job row — a shared helper so the
+/// two stay visually identical rather than drifting independently.
+fn status_pill(status: &str) -> Label {
+    Label::new(status.to_string())
+        .size(LabelSize::XSmall)
+        .color(status_color(status))
 }
 
 fn format_relative_time(dt: Option<DateTime<Utc>>) -> String {
