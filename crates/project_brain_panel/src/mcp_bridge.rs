@@ -92,7 +92,11 @@ fn rally_onboarding_snippet() -> String {
          a user message, your own response text, or a tool call with its real \
          parameters) as you work. Before starting each new step, call \
          `check_steering_messages` with your job id — nothing else interrupts \
-         you, so this is the only way you'll notice if a human redirected you.\n\
+         you, so this is the only way you'll notice if a human redirected you. \
+         Taking over someone else's unfinished job? `claim_agent_job` only \
+         succeeds once they've released it or reported their session closed — \
+         once it does, call `get_agent_job_turns` before doing anything else, so \
+         you continue their work instead of starting cold.\n\
          <!-- /rally-project-brain:onboarding -->"
     )
 }
@@ -414,7 +418,9 @@ runHook(async () => {
 "#;
 
 const SESSION_END_MJS: &str = r#"#!/usr/bin/env node
-// SessionEnd: mark this session's agent job done and clean up local state.
+// SessionEnd: mark this session's agent job done, report its owner session
+// closed (so a different actor may claim it without needing this one to
+// come back and explicitly release it), and clean up local state.
 import { readStdinJson, readState, clearState, api, runHook, ACTOR_ID } from "./rally-common.mjs";
 
 runHook(async () => {
@@ -428,6 +434,10 @@ runHook(async () => {
     actor_id: ACTOR_ID,
     status: "done",
     output_summary: `Session ended (${input.reason || "unknown"})`,
+  });
+
+  await api("POST", `/agent-jobs/${state.jobId}/close-session`, {
+    actor_id: ACTOR_ID,
   });
 
   clearState(input.session_id);
