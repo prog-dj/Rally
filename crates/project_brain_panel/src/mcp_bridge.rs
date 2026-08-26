@@ -86,8 +86,9 @@ fn rally_onboarding_snippet() -> String {
          session, before anything else, call `get_project_context` to see what's \
          already been done — other agents and humans share this project's memory. \
          Starting a new task? Call `create_agent_job` first with the human's \
-         actual request as `goal`, then `report_activity` (short status updates) \
-         and `report_turn` (your real conversation, verbatim, not a paraphrase — \
+         actual request as `goal`, then `report_activity` (short status updates \
+         — pass your job id as `job_id` so it groups under it in the feed) and \
+         `report_turn` (your real conversation, verbatim, not a paraphrase — \
          a user message, your own response text, or a tool call with its real \
          parameters) as you work. Before starting each new step, call \
          `check_steering_messages` with your job id — nothing else interrupts \
@@ -375,6 +376,7 @@ runHook(async () => {
       entity_id: entityId,
       verb,
       summary,
+      agent_job_id: state.jobId,
     });
 
     await api("PATCH", `/agent-jobs/${state.jobId}`, {
