@@ -1540,6 +1540,11 @@ impl ProjectBrainPanel {
                             response.id.clone(),
                             response.token.clone(),
                         );
+                        // Grabbed now, before response.id/token get moved
+                        // below, so the hook-shipping call after this
+                        // closure still has them.
+                        let actor_id_for_hooks = response.id.clone();
+                        let actor_token_for_hooks = response.token.clone();
                         let agent_info = ConnectedAgentInfo {
                             display_name: response.display_name.clone(),
                             token: response.token.clone(),
@@ -1562,7 +1567,16 @@ impl ProjectBrainPanel {
                             .upgrade()
                             .and_then(|ws| ws.read(cx).project().read(cx).visible_worktrees(cx).next())
                             .map(|wt| wt.read(cx).abs_path().to_path_buf());
-                        root.map(|root| (<dyn fs::Fs>::global(cx), root))
+                        root.map(|root| {
+                            (
+                                <dyn fs::Fs>::global(cx),
+                                root,
+                                backend_base_url(),
+                                project_id.clone(),
+                                actor_id_for_hooks,
+                                actor_token_for_hooks,
+                            )
+                        })
                     }
                     Ok(Err(err)) => {
                         panel.action_status = Some(format!("Connect agent failed: {err:#}"));
@@ -1580,8 +1594,19 @@ impl ProjectBrainPanel {
             // proactively, the same gap the CLI login flow closes for
             // agents connecting from outside Zed. Never blocks the panel;
             // failures are logged inside write_onboarding_instructions.
-            if let Ok(Some((fs, root))) = onboarding_target {
-                crate::mcp_bridge::write_onboarding_instructions(fs, root).await;
+            if let Ok(Some((fs, root, backend_url, project_id, actor_id, actor_token))) =
+                onboarding_target
+            {
+                crate::mcp_bridge::write_onboarding_instructions(fs.clone(), root.clone()).await;
+                crate::mcp_bridge::write_claude_code_hooks(
+                    fs,
+                    root,
+                    backend_url,
+                    project_id,
+                    actor_id,
+                    actor_token,
+                )
+                .await;
             }
         })
         .detach();
