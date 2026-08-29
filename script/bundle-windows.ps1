@@ -428,8 +428,8 @@ if($env:CI) {
 if ($buildSuccess) {
     Write-Output "Build successful"
     if ($Install) {
-        Write-Output "Installing Zed..."
-        Start-Process -FilePath "$env:ZED_WORKSPACE/target/ZedEditorUserSetup-x64-$env:RELEASE_VERSION.exe"
+        Write-Output "Installing Rally IDE..."
+        Start-Process -FilePath "$env:ZED_WORKSPACE/target/$appSetupName.exe"
     }
     exit 0
 }
