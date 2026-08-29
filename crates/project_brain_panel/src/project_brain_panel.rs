@@ -358,6 +358,18 @@ enum FeedItem {
     Group { job_id: String, events: Vec<FeedEvent> },
 }
 
+/// One row of the grouped transcript — a standalone prompt/output turn, or
+/// a tool call paired with its result (owns clones for the same reason
+/// `FeedItem` does — see `group_transcript_turns`). Mirrors the web
+/// dashboard's `transcript-detail.tsx` `DisplayItem` type.
+enum TranscriptItem {
+    Message(SessionTurn),
+    Tool {
+        call: SessionTurn,
+        result: Option<SessionTurn>,
+    },
+}
+
 /// Release/Report-session-closed are one-way handoff actions, so they go
 /// through an explicit confirm step (`confirming_job_action`) instead of
 /// firing on the first click — matching the equivalent fix already made in
@@ -419,6 +431,11 @@ pub struct ProjectBrainPanel {
     /// Index into the current search's matching turns — which one "next
     /// match" scrolls to.
     transcript_match_index: usize,
+    /// Tool-call turns (keyed by the call turn's id) currently expanded to
+    /// show their full input/result — collapsed by default, since raw tool
+    /// traffic (a full file's contents, a long diff) would otherwise
+    /// dominate the transcript and bury the actual conversation.
+    expanded_transcript_tool_ids: std::collections::HashSet<String>,
     /// One-way agent job actions (Release, Report session closed) awaiting
     /// an explicit confirm click before they actually fire.
     confirming_job_action: Option<(String, JobAction)>,
@@ -586,6 +603,7 @@ impl ProjectBrainPanel {
             transcript_return_view: PanelView::AgentJobs,
             transcript_search_editor,
             transcript_match_index: 0,
+            expanded_transcript_tool_ids: std::collections::HashSet::new(),
             confirming_job_action: None,
             job_turns: std::collections::HashMap::new(),
             steering_editor,
@@ -1357,6 +1375,7 @@ impl ProjectBrainPanel {
         self.transcript_job_id = Some(job_id.clone());
         self.active_view = PanelView::Transcript;
         self.transcript_match_index = 0;
+        self.expanded_transcript_tool_ids.clear();
         if !self.job_turns.contains_key(&job_id) {
             self.fetch_transcript(job_id, cx);
         }
@@ -3173,11 +3192,14 @@ impl ProjectBrainPanel {
                 .into_any_element();
         };
 
-        let job_title = self
+        let job = self
             .brief
             .as_ref()
             .and_then(|brief| brief.active_agent_jobs.iter().find(|j| j.id == job_id))
-            .map(|j| j.goal.clone());
+            .cloned();
+        let job_title = job.as_ref().map(|j| j.goal.clone());
+
+        let turn_count = self.job_turns.get(&job_id).map(Vec::len).unwrap_or(0);
 
         let mut root = v_flex()
             .gap_2()
@@ -3193,6 +3215,7 @@ impl ProjectBrainPanel {
                     .size(LabelSize::Default)
                     .weight(gpui::FontWeight::SEMIBOLD),
             )
+            .child(self.render_transcript_meta(&job_id, job.as_ref(), turn_count, cx))
             .child(
                 div()
                     .rounded_md()
@@ -3233,6 +3256,12 @@ impl ProjectBrainPanel {
                 .map(|turn| turn.id.clone())
                 .collect()
         };
+
+        // Grouped into owned items (clones, not borrows) — the same fix
+        // `group_feed_events` needed: a live borrow of `self.job_turns`
+        // can't survive into the `self.render_tool_item(...)` calls below,
+        // which need their own `&self` access to `expanded_transcript_tool_ids`.
+        let items = Self::group_transcript_turns(turns);
 
         if !query.is_empty() {
             if self.transcript_match_index >= matching_ids.len().max(1) {
@@ -3276,6 +3305,22 @@ impl ProjectBrainPanel {
             matching_ids.get(self.transcript_match_index).cloned()
         };
 
+        // A match landing inside a collapsed tool item must still be
+        // reachable — auto-expand whichever tool item owns it.
+        if let Some(active) = &active_id {
+            let owner = items.iter().find_map(|item| match item {
+                TranscriptItem::Tool { call, result }
+                    if &call.id == active || result.as_ref().map(|r| &r.id) == Some(active) =>
+                {
+                    Some(call.id.clone())
+                }
+                _ => None,
+            });
+            if let Some(call_id) = owner {
+                self.expanded_transcript_tool_ids.insert(call_id);
+            }
+        }
+
         root.child(
             v_flex()
                 .id(format!("transcript-list-{job_id}"))
@@ -3285,13 +3330,219 @@ impl ProjectBrainPanel {
                 .p_1()
                 .rounded_md()
                 .bg(cx.theme().colors().editor_background)
-                .children(turns.iter().map(|turn| {
-                    let is_match = matching_ids.contains(&turn.id);
-                    let is_active = Some(&turn.id) == active_id.as_ref();
-                    Self::render_turn(turn, is_match, is_active, cx)
+                .children(items.iter().map(|item| match item {
+                    TranscriptItem::Message(turn) => {
+                        let is_match = matching_ids.contains(&turn.id);
+                        let is_active = Some(&turn.id) == active_id.as_ref();
+                        Self::render_turn(turn, is_match, is_active, cx)
+                    }
+                    TranscriptItem::Tool { call, result } => {
+                        let is_match = matching_ids.contains(&call.id)
+                            || result.as_ref().is_some_and(|r| matching_ids.contains(&r.id));
+                        let is_active = Some(&call.id) == active_id.as_ref()
+                            || result.as_ref().is_some_and(|r| Some(&r.id) == active_id.as_ref());
+                        self.render_tool_item(call, result.as_ref(), is_match, is_active, cx)
+                    }
                 })),
         )
         .into_any_element()
+    }
+
+    /// A small facts card above the search bar — the panel is too narrow
+    /// for a literal side-by-side metadata sidebar (the web dashboard's
+    /// version), so this collapses the same facts (creator, claimant,
+    /// status, message count, id) into one stacked block instead.
+    fn render_transcript_meta(
+        &self,
+        job_id: &str,
+        job: Option<&BriefAgentJob>,
+        turn_count: usize,
+        cx: &mut Context<Self>,
+    ) -> gpui::AnyElement {
+        let short_id: String = job_id.chars().take(8).collect();
+        let copy_id = job_id.to_string();
+
+        let mut root = v_flex()
+            .gap_1()
+            .p_2()
+            .rounded_md()
+            .border_1()
+            .border_color(cx.theme().colors().border)
+            .bg(cx.theme().colors().editor_background);
+
+        if let Some(job) = job {
+            root = root.child(meta_row("Created by", self.display_name_for(&job.actor_id)));
+            if let Some(claimed_by) = &job.claimed_by_actor_id {
+                root = root.child(meta_row("Claimed by", self.display_name_for(claimed_by)));
+            }
+            root = root.child(
+                h_flex()
+                    .justify_between()
+                    .child(Label::new("Status").size(LabelSize::XSmall).color(Color::Muted))
+                    .child(status_pill(&job.status)),
+            );
+        }
+
+        root = root
+            .child(meta_row("Messages", turn_count.to_string()))
+            .child(
+                h_flex()
+                    .justify_between()
+                    .items_center()
+                    .gap_2()
+                    .child(Label::new("Session ID").size(LabelSize::XSmall).color(Color::Muted))
+                    .child(
+                        h_flex()
+                            .gap_1p5()
+                            .child(
+                                Label::new(short_id)
+                                    .size(LabelSize::XSmall)
+                                    .color(Color::Muted),
+                            )
+                            .child(
+                                Button::new("copy-transcript-job-id", "Copy")
+                                    .label_size(LabelSize::XSmall)
+                                    .on_click(cx.listener(move |_this, _, _, cx| {
+                                        cx.write_to_clipboard(ClipboardItem::new_string(
+                                            copy_id.clone(),
+                                        ));
+                                    })),
+                            ),
+                    ),
+            );
+
+        root.into_any_element()
+    }
+
+    /// A prompt/output turn (user message, assistant text) stands on its
+    /// own; a tool call and its result collapse into one grouped,
+    /// collapsible item — mirrors the web dashboard's transcript grouping
+    /// (transcript-detail.tsx's `groupTurns`). Raw tool traffic is the
+    /// least useful thing to read at a glance and the most likely to be a
+    /// wall of text, so it defaults to collapsed.
+    fn group_transcript_turns(turns: &[SessionTurn]) -> Vec<TranscriptItem> {
+        let mut items = Vec::new();
+        let mut i = 0;
+        while i < turns.len() {
+            let turn = &turns[i];
+            let is_tool_call =
+                matches!(turn.role, TurnRole::Assistant) && turn.tool_name.is_some() && turn.content.is_none();
+            if !is_tool_call {
+                items.push(TranscriptItem::Message(turn.clone()));
+                i += 1;
+                continue;
+            }
+            let paired = turns
+                .get(i + 1)
+                .filter(|next| matches!(next.role, TurnRole::Tool) && next.tool_use_id == turn.tool_use_id);
+            match paired {
+                Some(result) => {
+                    items.push(TranscriptItem::Tool {
+                        call: turn.clone(),
+                        result: Some(result.clone()),
+                    });
+                    i += 2;
+                }
+                None => {
+                    items.push(TranscriptItem::Tool {
+                        call: turn.clone(),
+                        result: None,
+                    });
+                    i += 1;
+                }
+            }
+        }
+        items
+    }
+
+    fn tool_summary(call: &SessionTurn) -> String {
+        let tool_name = call.tool_name.as_deref().unwrap_or("tool");
+        let raw = call
+            .tool_input
+            .as_ref()
+            .map(|v| v.to_string())
+            .unwrap_or_default();
+        const MAX_SUMMARY_CHARS: usize = 120;
+        let input = if raw.chars().count() > MAX_SUMMARY_CHARS {
+            let truncated: String = raw.chars().take(MAX_SUMMARY_CHARS).collect();
+            format!("{truncated}…")
+        } else {
+            raw
+        };
+        format!("→ {tool_name}({input})")
+    }
+
+    /// A collapsed-by-default tool call + its result — click the summary
+    /// row to expand the full input/output.
+    fn render_tool_item(
+        &self,
+        call: &SessionTurn,
+        result: Option<&SessionTurn>,
+        is_match: bool,
+        is_active: bool,
+        cx: &mut Context<Self>,
+    ) -> gpui::AnyElement {
+        let expanded = self.expanded_transcript_tool_ids.contains(&call.id);
+        let call_id = call.id.clone();
+        let toggle_id = call_id.clone();
+        let summary = Self::tool_summary(call);
+
+        let mut container = v_flex().gap_1p5().rounded_md().border_1().p_1p5();
+        container = if is_active {
+            container
+                .bg(Color::Warning.color(cx).opacity(0.16))
+                .border_color(Color::Warning.color(cx))
+        } else if is_match {
+            container
+                .bg(cx.theme().colors().element_background)
+                .border_color(cx.theme().colors().border)
+        } else {
+            container
+                .bg(cx.theme().colors().editor_background)
+                .border_color(cx.theme().colors().border)
+        };
+
+        container = container.child(
+            Button::new(
+                format!("toggle-transcript-tool-{call_id}"),
+                format!("{} {summary}", if expanded { "▾" } else { "▸" }),
+            )
+            .label_size(LabelSize::XSmall)
+            .color(Color::Muted)
+            .on_click(cx.listener(move |this, _, _, cx| {
+                if !this.expanded_transcript_tool_ids.remove(&toggle_id) {
+                    this.expanded_transcript_tool_ids.insert(toggle_id.clone());
+                }
+                cx.notify();
+            })),
+        );
+
+        if expanded {
+            let input_text = call
+                .tool_input
+                .as_ref()
+                .map(|v| serde_json::to_string_pretty(v).unwrap_or_default())
+                .unwrap_or_default();
+            container = container.child(
+                div()
+                    .rounded_md()
+                    .bg(cx.theme().colors().element_background)
+                    .p_1p5()
+                    .child(Label::new(input_text).size(LabelSize::XSmall).color(Color::Muted)),
+            );
+            if let Some(result) = result {
+                let result_text = result.content.clone().unwrap_or_default();
+                container = container.child(
+                    div()
+                        .rounded_md()
+                        .bg(cx.theme().colors().element_background)
+                        .p_1p5()
+                        .child(Label::new(result_text).size(LabelSize::XSmall)),
+                );
+            }
+        }
+
+        container.into_any_element()
     }
 
     fn step_transcript_match(&mut self, delta: i64, cx: &mut Context<Self>) {
@@ -3318,6 +3569,11 @@ impl ProjectBrainPanel {
         cx.notify();
     }
 
+    /// A standalone prompt/output turn — user and assistant-text turns only
+    /// (tool calls are grouped separately, see `render_tool_item`), so this
+    /// can afford to read as the "main content" of the transcript: bigger
+    /// text, a tinted border for a user turn, instead of competing
+    /// visually with collapsed tool traffic.
     fn render_turn(
         turn: &SessionTurn,
         is_match: bool,
@@ -3329,19 +3585,37 @@ impl ProjectBrainPanel {
             TurnRole::Assistant => ("ASSISTANT", Color::Default),
             TurnRole::Tool => ("TOOL RESULT", Color::Muted),
         };
+        let is_user = matches!(turn.role, TurnRole::User);
 
         let body = Self::turn_body(turn);
 
-        let mut container = v_flex().gap_0p5().p_1().rounded_md();
-        if is_active {
-            container = container.bg(Color::Warning.color(cx).opacity(0.16));
+        let mut container = v_flex().gap_0p5().p_1p5().rounded_md().border_1();
+        container = if is_active {
+            container
+                .bg(Color::Warning.color(cx).opacity(0.16))
+                .border_color(Color::Warning.color(cx))
         } else if is_match {
-            container = container.bg(cx.theme().colors().element_background);
-        }
+            container
+                .bg(cx.theme().colors().element_background)
+                .border_color(cx.theme().colors().border)
+        } else if is_user {
+            container
+                .bg(Color::Accent.color(cx).opacity(0.06))
+                .border_color(Color::Accent.color(cx).opacity(0.3))
+        } else {
+            container
+                .bg(cx.theme().colors().element_background)
+                .border_color(cx.theme().colors().border)
+        };
 
         container
-            .child(Label::new(role_label).size(LabelSize::XSmall).color(role_color))
-            .child(Label::new(body).size(LabelSize::Small))
+            .child(
+                Label::new(role_label)
+                    .size(LabelSize::XSmall)
+                    .weight(gpui::FontWeight::SEMIBOLD)
+                    .color(role_color),
+            )
+            .child(Label::new(body).size(LabelSize::Default))
             .into_any_element()
     }
 
@@ -4083,6 +4357,22 @@ fn status_pill(status: &str) -> Label {
     Label::new(status.to_string())
         .size(LabelSize::XSmall)
         .color(status_color(status))
+}
+
+/// A "label ... value" line for the transcript metadata card — kept as a
+/// free function rather than a method since it needs no panel state.
+fn meta_row(label: &str, value: String) -> gpui::AnyElement {
+    h_flex()
+        .justify_between()
+        .gap_2()
+        .child(Label::new(label.to_string()).size(LabelSize::XSmall).color(Color::Muted))
+        .child(
+            Label::new(value)
+                .size(LabelSize::XSmall)
+                .color(Color::Default)
+                .truncate(),
+        )
+        .into_any_element()
 }
 
 fn format_relative_time(dt: Option<DateTime<Utc>>) -> String {
