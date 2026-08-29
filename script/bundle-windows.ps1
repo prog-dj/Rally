@@ -271,43 +271,46 @@ function BuildInstaller {
         "stable" {
             $appId = "{{2DB0DA96-CA55-49BB-AF4F-64AF36A86712}"
             $appIconName = "app-icon"
-            $appName = "Zed"
-            $appDisplayName = "Zed"
-            $appSetupName = "Zed-$Architecture"
+            # User-facing installer/shell branding only — see the "dev" case
+            # below for why $appExeName/$appMutex/$appUserId/$appAppxFullName
+            # are left as-is.
+            $appName = "Rally IDE"
+            $appDisplayName = "Rally IDE"
+            $appSetupName = "Rally_IDE-$Architecture"
             # The mutex name here should match the mutex name in crates\zed\src\zed\windows_only_instance.rs
             $appMutex = "Zed-Stable-Instance-Mutex"
             $appExeName = "Zed"
             $regValueName = "Zed"
             $appUserId = "ZedIndustries.Zed"
-            $appShellNameShort = "Z&ed"
+            $appShellNameShort = "&Rally IDE"
             $appAppxFullName = "ZedIndustries.Zed_1.0.0.0_neutral__japxn1gcva8rg"
         }
         "preview" {
             $appId = "{{F70E4811-D0E2-4D88-AC99-D63752799F95}"
             $appIconName = "app-icon-preview"
-            $appName = "Zed Preview"
-            $appDisplayName = "Zed Preview"
-            $appSetupName = "Zed-$Architecture"
+            $appName = "Rally IDE Preview"
+            $appDisplayName = "Rally IDE Preview"
+            $appSetupName = "Rally_IDE-$Architecture"
             # The mutex name here should match the mutex name in crates\zed\src\zed\windows_only_instance.rs
             $appMutex = "Zed-Preview-Instance-Mutex"
             $appExeName = "Zed"
             $regValueName = "ZedPreview"
             $appUserId = "ZedIndustries.Zed.Preview"
-            $appShellNameShort = "Z&ed Preview"
+            $appShellNameShort = "&Rally IDE Preview"
             $appAppxFullName = "ZedIndustries.Zed.Preview_1.0.0.0_neutral__japxn1gcva8rg"
         }
         "nightly" {
             $appId = "{{1BDB21D3-14E7-433C-843C-9C97382B2FE0}"
             $appIconName = "app-icon-nightly"
-            $appName = "Zed Nightly"
-            $appDisplayName = "Zed Nightly"
-            $appSetupName = "Zed-$Architecture"
+            $appName = "Rally IDE Nightly"
+            $appDisplayName = "Rally IDE Nightly"
+            $appSetupName = "Rally_IDE-$Architecture"
             # The mutex name here should match the mutex name in crates\zed\src\zed\windows_only_instance.rs
             $appMutex = "Zed-Nightly-Instance-Mutex"
             $appExeName = "Zed"
             $regValueName = "ZedNightly"
             $appUserId = "ZedIndustries.Zed.Nightly"
-            $appShellNameShort = "Z&ed Editor Nightly"
+            $appShellNameShort = "&Rally IDE Nightly"
             $appAppxFullName = "ZedIndustries.Zed.Nightly_1.0.0.0_neutral__japxn1gcva8rg"
         }
         "dev" {
