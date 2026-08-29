@@ -96,7 +96,10 @@ fn rally_onboarding_snippet() -> String {
          Taking over someone else's unfinished job? `claim_agent_job` only \
          succeeds once they've released it or reported their session closed — \
          once it does, call `get_agent_job_turns` before doing anything else, so \
-         you continue their work instead of starting cold.\n\
+         you continue their work instead of starting cold. No tool tells you who \
+         you are unprompted — call `whoami` if you need your own actor id or \
+         display name (e.g. to refer to yourself in a message to another agent \
+         job).\n\
          <!-- /rally-project-brain:onboarding -->"
     )
 }
