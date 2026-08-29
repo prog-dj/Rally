@@ -2,13 +2,41 @@
   "hooks": {
     "PostToolUse": [
       {
-        "matcher": "Edit|Write|NotebookEdit|Bash|PowerShell|Grep|Glob",
+        "matcher": "*",
         "hooks": [
           {
             "type": "command",
-            "command": "node .claude/hooks/report-activity.mjs",
-            "timeout": 8,
-            "async": true
+            "command": "node .claude/hooks/post-tool-use.mjs"
+          }
+        ]
+      }
+    ],
+    "SessionStart": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "node .claude/hooks/session-start.mjs"
+          }
+        ]
+      }
+    ],
+    "UserPromptSubmit": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "node .claude/hooks/user-prompt-submit.mjs"
+          }
+        ]
+      }
+    ],
+    "SessionEnd": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "node .claude/hooks/session-end.mjs"
           }
         ]
       }

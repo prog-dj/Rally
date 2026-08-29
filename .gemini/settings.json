@@ -1,0 +1,17 @@
+{
+  "mcpServers": {
+    "rally-project-brain-claude-code-again": {
+      "command": "npx",
+      "args": [
+        "-y",
+        "rally-project-brain-mcp"
+      ],
+      "env": {
+        "RALLY_BACKEND_URL": "https://rally-backend.fly.dev",
+        "RALLY_PROJECT_ID": "583306fc-a3bf-415d-ae39-4ec63fed374d",
+        "RALLY_ACTOR_ID": "8cf36b25-688e-43bb-9c3b-0beed6761594",
+        "RALLY_ACTOR_TOKEN": "${RALLY_ACTOR_TOKEN}"
+      }
+    }
+  }
+}
