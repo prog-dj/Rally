@@ -85,9 +85,21 @@ fn rally_onboarding_snippet() -> String {
          This project is connected to Rally Project Brain. At the start of every \
          session, before anything else, call `get_project_context` to see what's \
          already been done — other agents and humans share this project's memory. \
-         Starting a new task? Call `create_agent_job` first with the human's \
-         actual request as `goal`, then `report_activity` (short status updates \
-         — pass your job id as `job_id` so it groups under it in the feed) and \
+         Starting a new task? Call `create_agent_job` ONCE, as your first action, \
+         with a short specific title as `goal` formatted as \"{{the operator's \
+         name, if known}}|{{your product name, e.g. Claude Code/Cursor/Gemini \
+         CLI/Codex}}|{{a few words on the task}}\" (e.g. \"Devansh|Claude \
+         Code|Review Rally project context\") — not the human's raw message \
+         verbatim, and not one call per message: keep using the same job id for \
+         every later request on the same task, and only call `create_agent_job` \
+         again if the human starts a genuinely new, unrelated task later in this \
+         session. If you're running as Claude Code, a session-level job was \
+         already auto-registered by the SessionStart hook before you saw this — \
+         its id and title prefix are in your startup context; this call \
+         registers a separate, task-specific job alongside it, so a human sees \
+         exactly two jobs per session (one for the session, one for the task), \
+         not one per message. Then `report_activity` (short status updates — \
+         pass your job id as `job_id` so it groups under it in the feed) and \
          `report_turn` (your real conversation, verbatim, not a paraphrase — \
          a user message, your own response text, or a tool call with its real \
          parameters) as you work. Before starting each new step, call \
@@ -180,6 +192,7 @@ const RALLY_COMMON_MJS: &str = r#"// Shared helpers for the Rally Project Brain 
 // deliberately fail-open: if the backend is down or misconfigured, hooks log
 // to stderr and exit 0 rather than interrupt the actual coding session.
 import { readFileSync, writeFileSync, existsSync, mkdirSync, unlinkSync } from "node:fs";
+import { execFileSync } from "node:child_process";
 import { join } from "node:path";
 import os from "node:os";
 
@@ -187,6 +200,30 @@ export const BASE_URL = process.env.RALLY_BACKEND_URL || "http://localhost:8080"
 export const PROJECT_ID = process.env.RALLY_PROJECT_ID;
 export const ACTOR_ID = process.env.RALLY_ACTOR_ID;
 export const ACTOR_TOKEN = process.env.RALLY_ACTOR_TOKEN;
+
+// Who's actually driving this session — used to tell concurrent agent jobs
+// apart in a job list ("Devansh|Claude Code|..." vs "Sam|Claude Code|...").
+// git config is the best available source without adding new setup steps;
+// falls back to the OS account name (often just a numeric profile id on
+// Windows, so it's a last resort, not a first choice) and then a placeholder.
+export function getPersonName() {
+  try {
+    const name = execFileSync("git", ["config", "user.name"], {
+      encoding: "utf8",
+      stdio: ["ignore", "pipe", "ignore"],
+    }).trim();
+    if (name) return name;
+  } catch {
+    // git not installed, no user.name set, or not inside a git repo.
+  }
+  try {
+    const username = os.userInfo().username;
+    if (username) return username;
+  } catch {
+    // ignore
+  }
+  return "Someone";
+}
 
 const STATE_DIR = join(os.tmpdir(), "rally-claude-hooks");
 
@@ -249,15 +286,23 @@ const SESSION_START_MJS: &str = r#"#!/usr/bin/env node
 // SessionStart: register an agent job for this Claude Code session and hand
 // back the project's shared-memory brief as additional context, so the
 // session starts already aware of open tasks/investigations.
-import { readStdinJson, writeState, api, runHook, PROJECT_ID, ACTOR_ID } from "./rally-common.mjs";
+import path from "node:path";
+import { readStdinJson, writeState, api, runHook, getPersonName, PROJECT_ID, ACTOR_ID } from "./rally-common.mjs";
 
 runHook(async () => {
   const input = await readStdinJson();
   if (!PROJECT_ID || !ACTOR_ID) return;
 
+  // "Name|Provider|Title" — the same prefix is handed to the agent below so
+  // its own task-level job (created via the create_agent_job tool) matches,
+  // and so two concurrent sessions in the same repo/directory are actually
+  // distinguishable in a job list instead of both reading identically.
+  const titlePrefix = `${getPersonName()}|Claude Code|`;
+  const dirName = input.cwd ? path.basename(input.cwd) : "unknown directory";
+
   const job = await api("POST", `/projects/${PROJECT_ID}/agent-jobs`, {
     actor_id: ACTOR_ID,
-    goal: `Claude Code session in ${input.cwd || "unknown directory"}`,
+    goal: `${titlePrefix}Session in ${dirName}`,
     context_snapshot: { source: input.source || "startup" },
   });
   await api("PATCH", `/agent-jobs/${job.id}`, { actor_id: ACTOR_ID, status: "running" });
@@ -280,7 +325,14 @@ runHook(async () => {
     activeInvestigations,
     "",
     `(This session is registered as agent job ${job.id} — file edits, commands, ` +
-      "and steering messages sent via the Project Brain dashboard/Zed panel will show up here.)",
+      "and steering messages sent via the Project Brain dashboard/Zed panel will show up here. " +
+      `Its title starts with "${titlePrefix}" — reuse that exact prefix if you register a ` +
+      `task-level job (call create_agent_job ONCE, as your first action, for the actual task, ` +
+      `with goal formatted as "${titlePrefix}<a few words on the task>", e.g. ` +
+      `"${titlePrefix}Review Rally project context" — not a call per message. For every later ` +
+      "request in this same session, keep using that same task job id instead of creating " +
+      "another one; only call create_agent_job again if the human starts a genuinely new, " +
+      "unrelated task later in this session.)",
   ].join("\n");
 
   console.log(

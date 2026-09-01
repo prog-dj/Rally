@@ -2,6 +2,7 @@
 // deliberately fail-open: if the backend is down or misconfigured, hooks log
 // to stderr and exit 0 rather than interrupt the actual coding session.
 import { readFileSync, writeFileSync, existsSync, mkdirSync, unlinkSync } from "node:fs";
+import { execFileSync } from "node:child_process";
 import { join } from "node:path";
 import os from "node:os";
 
@@ -9,6 +10,30 @@ export const BASE_URL = process.env.RALLY_BACKEND_URL || "http://localhost:8080"
 export const PROJECT_ID = process.env.RALLY_PROJECT_ID;
 export const ACTOR_ID = process.env.RALLY_ACTOR_ID;
 export const ACTOR_TOKEN = process.env.RALLY_ACTOR_TOKEN;
+
+// Who's actually driving this session — used to tell concurrent agent jobs
+// apart in a job list ("Devansh|Claude Code|..." vs "Sam|Claude Code|...").
+// git config is the best available source without adding new setup steps;
+// falls back to the OS account name (often just a numeric profile id on
+// Windows, so it's a last resort, not a first choice) and then a placeholder.
+export function getPersonName() {
+  try {
+    const name = execFileSync("git", ["config", "user.name"], {
+      encoding: "utf8",
+      stdio: ["ignore", "pipe", "ignore"],
+    }).trim();
+    if (name) return name;
+  } catch {
+    // git not installed, no user.name set, or not inside a git repo.
+  }
+  try {
+    const username = os.userInfo().username;
+    if (username) return username;
+  } catch {
+    // ignore
+  }
+  return "Someone";
+}
 
 const STATE_DIR = join(os.tmpdir(), "rally-claude-hooks");
 
