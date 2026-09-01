@@ -151,7 +151,15 @@ fn rally_onboarding_snippet() -> String {
          This project is connected to Rally Project Brain. At the start of every \
          session, before anything else, call `get_project_context` to see what's \
          already been done — other agents and humans share this project's memory. \
-         Starting a new task? Call `create_agent_job` ONCE, as your first action, \
+         If your tool list has more than one Rally connector (distinct tool-name \
+         prefixes, e.g. `rally-project-brain-claude-code-again__whoami` vs \
+         `rally-project-brain-demo-agent__whoami` — this happens once more than one \
+         actor has ever been connected to this project from this client), call \
+         `whoami` on EACH one immediately, before doing anything else, and tell the \
+         human which one you're using by default for reporting — don't wait to be \
+         asked which identity you are; that confusion is a known, recurring problem \
+         and this is the fix for it. Starting a new task? Call `create_agent_job` \
+         ONCE, as your first action, \
          with a short specific title as `goal` formatted as \"{{the operator's \
          name, if known}}|{{your product name, e.g. Claude Code/Cursor/Gemini \
          CLI/Codex}}|{{a few words on the task}}\" (e.g. \"Devansh|Claude \
