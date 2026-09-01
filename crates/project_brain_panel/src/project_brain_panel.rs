@@ -1707,6 +1707,7 @@ impl ProjectBrainPanel {
                             project_id.clone(),
                             response.id.clone(),
                             response.token.clone(),
+                            response.display_name.clone(),
                         );
                         // Grabbed now, before response.id/token get moved
                         // below, so the hook-shipping call after this
@@ -1766,7 +1767,7 @@ impl ProjectBrainPanel {
                 onboarding_target
             {
                 crate::mcp_bridge::write_onboarding_instructions(fs.clone(), root.clone()).await;
-                crate::mcp_bridge::write_claude_code_hooks(
+                let replaced_different_actor = crate::mcp_bridge::write_claude_code_hooks(
                     fs,
                     root,
                     backend_url,
@@ -1775,6 +1776,25 @@ impl ProjectBrainPanel {
                     actor_token,
                 )
                 .await;
+                // .claude/settings.json's env is one project-wide slot, not
+                // per-actor like the MCP context server list above — a
+                // second agent's hooks genuinely can't coexist with the
+                // first's in the same worktree. Surface that plainly
+                // instead of leaving the identity switch invisible; see
+                // write_claude_code_hooks's doc comment for the full story.
+                if replaced_different_actor {
+                    this.update(cx, |panel, cx| {
+                        panel.action_status = Some(
+                            "Connected — but this worktree already had a different agent's \
+                             Claude Code hooks; new terminal sessions here will now \
+                             authenticate as this agent instead. Use a separate worktree per \
+                             agent to run both at once."
+                                .into(),
+                        );
+                        cx.notify();
+                    })
+                    .ok();
+                }
             }
         })
         .detach();

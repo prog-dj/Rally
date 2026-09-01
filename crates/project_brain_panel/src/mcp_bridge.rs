@@ -9,12 +9,16 @@
 //! Rally entry shows up in Zed's settings/MCP UI exactly like any other
 //! hand-configured context server would.
 //!
-//! Known v1 limitation: `update_settings_file` only targets the user-level
-//! settings file (there is no project-scoped equivalent in this version of
-//! Zed), so this upserts a single well-known `"rally"` entry — only the
-//! most-recently-connected Rally project's credentials are active MCP-wide
-//! per Zed install. Fine for one active connection at a time; not a
-//! multi-project-simultaneously story.
+//! Each connected actor gets its own entry, keyed by actor id (not a single
+//! shared slot every new connection overwrote — see
+//! `register_rally_context_server`'s doc comment for the real cross-actor
+//! credential mixup that caused).
+//!
+//! Remaining known limitation: `update_settings_file` only targets the
+//! user-level settings file (there is no project-scoped equivalent in this
+//! version of Zed), so every actor connected from any project in this Zed
+//! install shows up in this same global list — not a multi-project-
+//! simultaneously story, just no longer a self-destructive one.
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -26,29 +30,41 @@ use serde_json::{json, Value as JsonValue};
 use settings::update_settings_file;
 use settings_content::{ContextServerCommand, ContextServerSettingsContent};
 
-const RALLY_CONTEXT_SERVER_ID: &str = "rally";
-
-/// Upserts the `"rally"` context server entry in the user's Zed settings
-/// with this actor's credentials, referencing it as `npx
-/// rally-project-brain-mcp` — the package is published to npm, so this
-/// needs no local `Rally_Backend` checkout or `RALLY_MCP_SERVER_PATH` env
-/// var (an earlier version of this function required both, and silently
-/// no-op'd with only a log warning if the env var wasn't set — a real
-/// dead-end for anyone without a local backend checkout). `npx` resolves
-/// the package fresh each launch, so this stays correct regardless of
-/// local cache state, same reasoning as the external `login --agent` CLI
-/// flow.
+/// Upserts this actor's context server entry in the user's Zed settings,
+/// referencing it as `npx rally-project-brain-mcp` — the package is
+/// published to npm, so this needs no local `Rally_Backend` checkout or
+/// `RALLY_MCP_SERVER_PATH` env var (an earlier version of this function
+/// required both, and silently no-op'd with only a log warning if the env
+/// var wasn't set — a real dead-end for anyone without a local backend
+/// checkout). `npx` resolves the package fresh each launch, so this stays
+/// correct regardless of local cache state, same reasoning as the external
+/// `login --agent` CLI flow.
+///
+/// The entry's key is per-actor (`resolve_context_server_key`), not a
+/// single fixed `"rally"` slot — an earlier version used a fixed key, so
+/// connecting a second agent did a plain map insert that DELETED the first
+/// agent's entry outright, silently switching any already-open agent
+/// conversation over to the second agent's identity the next time Zed
+/// reconnected the context server. Real cross-actor credential mixup, not
+/// just a cosmetic issue.
+///
+/// Remaining known limitation: `update_settings_file` only targets the
+/// user-level settings file (there is no project-scoped equivalent in this
+/// version of Zed), so every actor connected from any project in this Zed
+/// install shows up in this same global list — not a multi-project-
+/// simultaneously story, just no longer a self-destructive one.
 pub fn register_rally_context_server(
     cx: &App,
     backend_url: String,
     project_id: String,
     actor_id: String,
     actor_token: String,
+    display_name: String,
 ) {
     let mut env = HashMap::default();
     env.insert("RALLY_BACKEND_URL".to_string(), backend_url);
     env.insert("RALLY_PROJECT_ID".to_string(), project_id);
-    env.insert("RALLY_ACTOR_ID".to_string(), actor_id);
+    env.insert("RALLY_ACTOR_ID".to_string(), actor_id.clone());
     env.insert("RALLY_ACTOR_TOKEN".to_string(), actor_token);
 
     let entry = ContextServerSettingsContent::Stdio {
@@ -64,11 +80,61 @@ pub fn register_rally_context_server(
 
     let fs = <dyn Fs>::global(cx);
     update_settings_file(fs, cx, move |settings, _| {
-        settings
-            .project
-            .context_servers
-            .insert(Arc::from(RALLY_CONTEXT_SERVER_ID), entry);
+        let key = resolve_context_server_key(&settings.project.context_servers, &actor_id, &display_name);
+        settings.project.context_servers.insert(key, entry);
     });
+}
+
+/// Picks the `context_servers` key for this actor instead of a single
+/// fixed slot every actor overwrites — see `register_rally_context_server`
+/// for why that matters. Mirrors `mcp-server/index.mjs`'s
+/// `resolveServerKey` exactly (the JS side, for the CLI `login --agent`
+/// flow, hit and fixed this same bug first — if you edit one, edit both).
+///
+/// Reconnecting the SAME actor (matched by `RALLY_ACTOR_ID` in its env)
+/// reuses its existing key, so re-running "Connect an agent" for one
+/// already-known actor doesn't pile up duplicate entries. A genuinely
+/// different actor gets its own slugified-name key, disambiguated with a
+/// short id suffix only if that name is already taken by someone else.
+fn resolve_context_server_key(
+    existing: &HashMap<Arc<str>, ContextServerSettingsContent>,
+    actor_id: &str,
+    display_name: &str,
+) -> Arc<str> {
+    for (key, server) in existing {
+        if let ContextServerSettingsContent::Stdio { command, .. } = server {
+            if command
+                .env
+                .as_ref()
+                .and_then(|env| env.get("RALLY_ACTOR_ID"))
+                .map(String::as_str)
+                == Some(actor_id)
+            {
+                return key.clone();
+            }
+        }
+    }
+
+    let mut slug = String::with_capacity(display_name.len());
+    let mut last_dash = false;
+    for c in display_name.to_lowercase().chars() {
+        if c.is_ascii_alphanumeric() {
+            slug.push(c);
+            last_dash = false;
+        } else if !last_dash {
+            slug.push('-');
+            last_dash = true;
+        }
+    }
+    let slug = slug.trim_matches('-');
+    let slug = if slug.is_empty() { "agent" } else { slug };
+
+    let base_key = format!("rally-{slug}");
+    if !existing.contains_key(base_key.as_str()) {
+        return Arc::from(base_key);
+    }
+    let suffix_len = actor_id.len().min(8);
+    Arc::from(format!("{base_key}-{}", &actor_id[..suffix_len]))
 }
 
 /// Same marker/snippet the CLI (`mcp-server login --agent`) writes — kept
@@ -508,6 +574,20 @@ runHook(async () => {
 /// so a project onboarded from either path ends up with the same hooks.
 /// Best-effort: a write failure is logged and skipped, never fails the
 /// connection itself.
+///
+/// Unlike `register_rally_context_server`'s per-actor `context_servers`
+/// entries, `.claude/settings.json`'s `env` block has no per-actor concept
+/// at all — Claude Code reads ONE project-wide `env` at session start, so
+/// there is no clean multi-tenant fix here the way there was for the MCP
+/// context server list. Connecting a second agent's hooks into the same
+/// worktree still overwrites the first agent's credentials; every
+/// already-configured Claude Code session keeps running fine (env is read
+/// once at startup), but any NEW session started here afterward — a fresh
+/// terminal, a resumed one — silently authenticates as the second agent
+/// instead. Returns `true` when this call just replaced a *different*
+/// actor's env (so the caller can surface a real warning instead of
+/// leaving that switch invisible); recommend a separate git worktree per
+/// concurrently-connected agent instead of sharing one directory.
 pub async fn write_claude_code_hooks(
     fs: Arc<dyn Fs>,
     worktree_root: PathBuf,
@@ -515,7 +595,7 @@ pub async fn write_claude_code_hooks(
     project_id: String,
     actor_id: String,
     actor_token: String,
-) {
+) -> bool {
     let hooks_dir = worktree_root.join(".claude").join("hooks");
     let hook_files: [(&str, &str); 5] = [
         ("rally-common.mjs", RALLY_COMMON_MJS),
@@ -554,6 +634,19 @@ pub async fn write_claude_code_hooks(
         *env = json!({});
     }
     let env_obj = env.as_object_mut().expect("env is always an object here");
+    let replaced_different_actor = env_obj
+        .get("RALLY_ACTOR_ID")
+        .and_then(|v| v.as_str())
+        .is_some_and(|existing_id| existing_id != actor_id);
+    if replaced_different_actor {
+        log::warn!(
+            "write_claude_code_hooks: {} already had a different actor's RALLY_ACTOR_ID — \
+             overwriting with {actor_id}. New Claude Code sessions started here will now \
+             authenticate as this actor; already-running sessions are unaffected (env is \
+             read once at startup). Use a separate worktree per agent to avoid this.",
+            settings_path.display()
+        );
+    }
     env_obj.insert("RALLY_BACKEND_URL".to_string(), json!(backend_url));
     env_obj.insert("RALLY_PROJECT_ID".to_string(), json!(project_id));
     env_obj.insert("RALLY_ACTOR_ID".to_string(), json!(actor_id));
@@ -589,10 +682,11 @@ pub async fn write_claude_code_hooks(
         Ok(s) => s,
         Err(err) => {
             log::warn!("couldn't serialize .claude/settings.json: {err:#}");
-            return;
+            return replaced_different_actor;
         }
     };
     if let Err(err) = fs.atomic_write(settings_path.clone(), format!("{serialized}\n")).await {
         log::warn!("couldn't write {}: {err:#}", settings_path.display());
     }
+    replaced_different_actor
 }
